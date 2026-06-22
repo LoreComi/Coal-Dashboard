@@ -582,3 +582,152 @@ def compute_similar_years(historical_cdd: pd.DataFrame, current_cum: pd.DataFram
         scores.append((year, score))
     scores.sort(key=lambda x: x[1])
     return scores[:n_similar]
+
+
+# ─── Watershed analysis ──────────────────────────────────────────────────────────
+
+# Bounding box derived from three_gorges_catchment.geojson (actual HYDROBASINS catchment)
+THREE_GORGES_BOUNDS = {'lat_min': 24.5, 'lat_max': 35.9, 'lon_min': 90.5, 'lon_max': 111.2}
+THREE_GORGES_DAM    = (111.0056, 30.8233)   # (lon, lat) — exact dam coordinates
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_watershed_precip(region_name: str):
+    """Return (hist_df, fcst_df, clim_df) area-averaged precipitation for a watershed.
+
+    hist_df : current-year daily area-average precip   (date, precipitation)
+    fcst_df : ECMWF-ENS 14-day forecast                (date, precipitation)
+    clim_df : ERA5 2000–2024 day-of-year climatology   (doy, mean_precip, std_precip)
+    """
+    BOUNDS_MAP = {
+        'Three Gorges': THREE_GORGES_BOUNDS,
+    }
+    if region_name not in BOUNDS_MAP:
+        empty = pd.DataFrame()
+        return empty, empty, empty
+
+    b  = BOUNDS_MAP[region_name]
+    cy = datetime.now().year
+    box = (f"latitude  BETWEEN {b['lat_min']} AND {b['lat_max']} "
+           f"AND longitude BETWEEN {b['lon_min']} AND {b['lon_max']}")
+
+    hist_q = f"""
+    SELECT CAST(delivery_start AS DATE) as date, AVG(value) as precipitation
+    FROM {TABLE_PRECIP_HIST}
+    WHERE model = '{MODEL_HIST}' AND curve_name = '{CURVE_PRECIP_HIST}'
+      AND CAST(delivery_start AS DATE) >= '{cy}-01-01'
+      AND {box}
+    GROUP BY CAST(delivery_start AS DATE) ORDER BY date
+    """
+    fcst_q = f"""
+    SELECT CAST(delivery_start AS DATE) as date, AVG(value) as precipitation
+    FROM {TABLE_PRECIP_FCST}
+    WHERE model = '{MODEL_FCST}' AND curve_name = '{CURVE_PRECIP_FCST}'
+      AND delivery_start >= CURRENT_DATE()
+      AND {box}
+    GROUP BY CAST(delivery_start AS DATE) ORDER BY date
+    """
+    clim_q = f"""
+    SELECT DAYOFYEAR(delivery_start) as doy,
+           AVG(value) as mean_precip, STDDEV(value) as std_precip
+    FROM {TABLE_PRECIP_HIST}
+    WHERE model = '{MODEL_HIST}' AND curve_name = '{CURVE_PRECIP_HIST}'
+      AND YEAR(delivery_start) BETWEEN {HIST_START_YEAR} AND {HIST_END_YEAR}
+      AND {box}
+    GROUP BY DAYOFYEAR(delivery_start) ORDER BY doy
+    """
+
+    hist_df = run_query(hist_q)
+    fcst_df = run_query(fcst_q)
+    clim_df = run_query(clim_q)
+
+    if not hist_df.empty:
+        hist_df['date']          = pd.to_datetime(hist_df['date'])
+        hist_df['precipitation'] = hist_df['precipitation'].astype(float)
+    if not fcst_df.empty:
+        fcst_df['date']          = pd.to_datetime(fcst_df['date'])
+        fcst_df['precipitation'] = fcst_df['precipitation'].astype(float)
+    if not clim_df.empty:
+        clim_df['doy']           = clim_df['doy'].astype(int)
+        clim_df['mean_precip']   = clim_df['mean_precip'].astype(float)
+        clim_df['std_precip']    = clim_df['std_precip'].fillna(0).astype(float)
+
+    _e = lambda cols: pd.DataFrame(columns=cols)
+    return (
+        hist_df if not hist_df.empty else _e(['date', 'precipitation']),
+        fcst_df if not fcst_df.empty else _e(['date', 'precipitation']),
+        clim_df if not clim_df.empty else _e(['doy', 'mean_precip', 'std_precip']),
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_gatun_lake_levels():
+    """Download Gatun Lake observed levels + official ACP forecast.
+
+    Source: Panama Canal Authority — https://evtms-rpts.pancanal.com/eng/h2o/index.html
+    Returns (hist_df, proj_df) where both have columns: date (datetime), level_ft (float).
+    hist_df contains all historical observations; proj_df contains the official projection.
+    """
+    import io
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    HIST_URL = ("https://evtms-rpts.pancanal.com/eng/h2o/"
+                "Download_Gatun_Lake_Water_Level_History.csv")
+    PROJ_URL = ("https://evtms-rpts.pancanal.com/eng/h2o/"
+                "Gatun_Water_Level_Projection.csv")
+    HEADERS  = {"User-Agent": "Mozilla/5.0 (compatible; CDD-Dashboard/1.0)"}
+
+    def _fetch(url):
+        r = requests.get(url, headers=HEADERS, timeout=30, verify=False)
+        r.raise_for_status()
+        return r.text
+
+    # ── Historical levels ──────────────────────────────────────────────────────
+    hist_raw = _fetch(HIST_URL)
+    hist_df  = pd.read_csv(io.StringIO(hist_raw))
+    hist_df.columns = [c.strip() for c in hist_df.columns]
+
+    date_col  = next((c for c in hist_df.columns if any(k in c.upper() for k in ['DATE', 'FECHA'])),
+                     hist_df.columns[0])
+    level_col = next((c for c in hist_df.columns if any(k in c.upper() for k in ['LEVEL', 'FEET', 'NIVEL'])),
+                     hist_df.columns[1])
+
+    hist_df[date_col]  = pd.to_datetime(hist_df[date_col],  errors='coerce')
+    hist_df[level_col] = pd.to_numeric(hist_df[level_col],  errors='coerce')
+    hist_df = (hist_df[[date_col, level_col]]
+               .dropna()
+               .rename(columns={date_col: 'date', level_col: 'level_ft'})
+               .query('level_ft > 60')
+               .sort_values('date')
+               .reset_index(drop=True))
+
+    # ── Official ACP projection ────────────────────────────────────────────────
+    proj_raw = _fetch(PROJ_URL)
+    proj_df  = None
+    for skip in [2, 1, 0]:
+        try:
+            candidate = pd.read_csv(io.StringIO(proj_raw), skiprows=skip)
+            candidate.columns = [c.strip() for c in candidate.columns]
+            if len(candidate) >= 3 and len(candidate.columns) >= 2:
+                proj_df = candidate
+                break
+        except Exception:
+            continue
+
+    if proj_df is not None:
+        date_col  = next((c for c in proj_df.columns if 'date' in c.lower()), proj_df.columns[0])
+        level_col = next((c for c in proj_df.columns if any(k in c.lower() for k in ['level', 'water', 'gatun'])),
+                         proj_df.columns[1])
+        proj_df[date_col]  = pd.to_datetime(proj_df[date_col],  errors='coerce', dayfirst=False)
+        proj_df[level_col] = pd.to_numeric(proj_df[level_col],  errors='coerce')
+        proj_df = (proj_df[[date_col, level_col]]
+                   .dropna()
+                   .rename(columns={date_col: 'date', level_col: 'level_ft'})
+                   .sort_values('date')
+                   .reset_index(drop=True))
+    else:
+        proj_df = pd.DataFrame(columns=['date', 'level_ft'])
+
+    return hist_df, proj_df
