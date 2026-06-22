@@ -27,6 +27,7 @@ from _config import (
 from _data import (
     load_historical, load_forecast, load_city_timeseries, load_anomalies,
     compute_region_cdd, compute_cumulative, compute_normal,
+    load_all_historical_cumulative, compute_similar_years,
 )
 from _charts import (
     make_cumulative_cdd_chart, make_temperature_chart,
@@ -104,7 +105,14 @@ def render_cdd_dashboard():
             cum_prev = compute_cumulative(region_cdd, prev_year)
             normal = compute_normal(region_cdd)
 
-            fig = make_cumulative_cdd_chart(region, cum_current, cum_prev, normal, current_year)
+            all_hist_cum = load_all_historical_cumulative(region_cdd)
+            sim_years = compute_similar_years(region_cdd, cum_current)
+
+            fig = make_cumulative_cdd_chart(
+                region, cum_current, cum_prev, normal, current_year,
+                all_historical_cumulative=all_hist_cum,
+                similar_years=sim_years,
+            )
 
             with cols[idx % 2]:
                 st.plotly_chart(fig, use_container_width=True)

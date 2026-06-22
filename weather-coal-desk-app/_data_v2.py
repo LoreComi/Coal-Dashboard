@@ -539,3 +539,46 @@ def compute_normal(cdd_df: pd.DataFrame) -> pd.DataFrame:
     stats['upper'] = stats['mean'] + stats['std']
     stats['lower'] = (stats['mean'] - stats['std']).clip(lower=0)
     return stats
+
+
+def load_all_historical_cumulative(historical_cdd: pd.DataFrame) -> dict:
+    """Pre-compute cumulative CDD DataFrames for every historical year (2000–2024)."""
+    result = {}
+    for year in range(HIST_START_YEAR, HIST_END_YEAR + 1):
+        cum = compute_cumulative(historical_cdd, year)
+        if not cum.empty:
+            result[year] = cum
+    return result
+
+
+def compute_similar_years(historical_cdd: pd.DataFrame, current_cum: pd.DataFrame, n_similar: int = 5) -> list:
+    """Return the n historical years whose CDD trajectory best matches the current year's.
+
+    Similarity = weighted blend of RMSE (70%) and rate-of-change RMSE (30%) over
+    the days elapsed so far in the current season.
+    Returns a list of (year, score) tuples sorted ascending by score (best first).
+    """
+    if current_cum.empty or historical_cdd.empty:
+        return []
+    n_days = len(current_cum)
+    if n_days < 5:
+        return []
+    curr_y = int(current_cum['date'].dt.year.iloc[0])
+    curr_vals = current_cum['cumulative_cdd'].values
+    scores = []
+    for year in range(HIST_START_YEAR, HIST_END_YEAR + 1):
+        if year == curr_y:
+            continue
+        hist_cum = compute_cumulative(historical_cdd, year)
+        if hist_cum.empty or len(hist_cum) < n_days:
+            continue
+        hist_vals = hist_cum['cumulative_cdd'].iloc[:n_days].values
+        rmse = np.sqrt(np.mean((curr_vals - hist_vals) ** 2))
+        if n_days > 1:
+            rate_rmse = np.sqrt(np.mean((np.diff(curr_vals) - np.diff(hist_vals)) ** 2))
+            score = 0.7 * rmse + 0.3 * rate_rmse
+        else:
+            score = float(rmse)
+        scores.append((year, score))
+    scores.sort(key=lambda x: x[1])
+    return scores[:n_similar]

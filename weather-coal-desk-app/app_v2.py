@@ -22,6 +22,7 @@ from _data_v2 import (
     load_precomputed_cdd, load_precomputed_historical, load_precomputed_forecasts,
     load_current_year_cdd, load_gridded_anomalies, load_gridded_anomalies_multiday,
     load_gridded_precip_deviation, MAP_REGIONS,
+    load_all_historical_cumulative, compute_similar_years,
 )
 from _charts import (
     make_cumulative_cdd_chart, make_temperature_chart,
@@ -83,7 +84,16 @@ def render_cdd_dashboard():
             cum_current = compute_cumulative(combined, current_year)
             cum_prev = compute_cumulative(region_cdd, current_year - 1)
             normal = compute_normal(region_cdd)
-            fig = make_cumulative_cdd_chart(region, cum_current, cum_prev, normal, current_year)
+
+            # Similarity analysis — pre-compute all historical trajectories once
+            all_hist_cum = load_all_historical_cumulative(region_cdd)
+            sim_years = compute_similar_years(region_cdd, cum_current)
+
+            fig = make_cumulative_cdd_chart(
+                region, cum_current, cum_prev, normal, current_year,
+                all_historical_cumulative=all_hist_cum,
+                similar_years=sim_years,
+            )
             with cols[idx % 2]:
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -150,6 +160,80 @@ def render_forecast_overview():
 
 
 # ─── Tab 3: Anomaly Map ──────────────────────────────────────────────────────────
+
+# Dark matplotlib style matching the app's navy theme
+_MPL_DARK = {
+    'figure.facecolor': '#07111f',
+    'axes.facecolor':   '#0c1828',
+    'text.color':       '#e4eeff',
+    'axes.labelcolor':  '#e4eeff',
+    'xtick.color':      '#7d9ab8',
+    'ytick.color':      '#7d9ab8',
+    'axes.titlecolor':  '#e4eeff',
+    'axes.edgecolor':   'rgba(255,255,255,0.15)',
+    'grid.color':       'rgba(255,255,255,0.07)',
+    'axes.titlesize':   13,
+    'font.family':      'sans-serif',
+}
+_LAND_COLOR  = '#1a2942'
+_OCEAN_COLOR = '#07111f'
+_COAST_COLOR = (1, 1, 1, 0.35)
+_BORDER_COLOR = (1, 1, 1, 0.18)
+
+
+def _make_map_fig(lons, lats, data_2d, bounds, title, cmap, levels, cbar_label,
+                  has_cartopy):
+    """Render a single contourf map (cartopy or plain matplotlib) with dark theme."""
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
+
+    with plt.rc_context(_MPL_DARK):
+        if has_cartopy:
+            import cartopy.crs as ccrs
+            import cartopy.feature as cfeature
+            fig_mpl, ax = plt.subplots(
+                1, 1, figsize=(12, 7),
+                subplot_kw={'projection': ccrs.PlateCarree()},
+            )
+            ax.set_facecolor(_OCEAN_COLOR)
+            ax.set_extent(
+                [bounds['lon_min'], bounds['lon_max'],
+                 bounds['lat_min'], bounds['lat_max']],
+                crs=ccrs.PlateCarree(),
+            )
+            ax.add_feature(cfeature.OCEAN, color=_OCEAN_COLOR, zorder=0)
+            ax.add_feature(cfeature.LAND,  color=_LAND_COLOR,  zorder=0)
+            ax.add_feature(cfeature.BORDERS, linewidth=0.5,
+                           edgecolor=_BORDER_COLOR, zorder=2)
+            ax.coastlines(linewidth=0.8, color=_COAST_COLOR, zorder=2)
+            cf = ax.contourf(
+                lons, lats, data_2d, levels=levels,
+                cmap=cmap, extend='both', transform=ccrs.PlateCarree(), zorder=1,
+            )
+            gl = ax.gridlines(draw_labels=True, linewidth=0.4,
+                              color='rgba(255,255,255,0.1)', alpha=0.5)
+            gl.top_labels = False
+            gl.right_labels = False
+            gl.xlabel_style = {'color': '#7d9ab8', 'size': 8}
+            gl.ylabel_style = {'color': '#7d9ab8', 'size': 8}
+        else:
+            fig_mpl, ax = plt.subplots(1, 1, figsize=(12, 7))
+            cf = ax.contourf(lons, lats, data_2d, levels=levels, cmap=cmap, extend='both')
+            ax.set_xlim(bounds['lon_min'], bounds['lon_max'])
+            ax.set_ylim(bounds['lat_min'], bounds['lat_max'])
+            ax.set_xlabel('Longitude', color='#7d9ab8')
+            ax.set_ylabel('Latitude', color='#7d9ab8')
+
+        cbar = fig_mpl.colorbar(cf, ax=ax, orientation='horizontal',
+                                pad=0.06, fraction=0.046, label=cbar_label)
+        cbar.ax.xaxis.label.set_color('#e4eeff')
+        cbar.ax.tick_params(colors='#7d9ab8')
+        cbar.outline.set_edgecolor('rgba(255,255,255,0.15)')
+        ax.set_title(title, pad=10)
+        plt.tight_layout()
+    return fig_mpl
+
+
 def render_anomaly_map():
     st.markdown("#### TEMPERATURE ANOMALY MAP")
     st.caption("Gridded forecast deviation from ERA5 climatology (2000–2024). Data: ECMWF-ENS.")
@@ -163,172 +247,86 @@ def render_anomaly_map():
     target_date = (datetime.now() + timedelta(days=forecast_day)).date()
     st.caption(f"Target: **{target_date}** | Region: **{map_region}**")
 
-    with st.spinner(f"Loading gridded anomaly map for {map_region}..."):
-        try:
-            grid_df = load_gridded_anomalies(map_region, target_date)
-        except Exception as e:
-            st.error(f"Error loading map data: {e}")
-            return
-
-    if grid_df.empty:
-        st.warning("No forecast data available for the selected date and region.")
-        return
-
     bounds = MAP_REGIONS[map_region]
     today_d = datetime.now().date()
 
-    # Generate 5-day period maps with cartopy (matching notebook output)
     import matplotlib
     matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
     try:
-        import cartopy.crs as ccrs
-        import cartopy.feature as cfeature
+        import cartopy.crs as ccrs      # noqa: F401
+        import cartopy.feature as cfeature  # noqa: F401
         has_cartopy = True
     except ImportError:
         has_cartopy = False
 
-    periods = []
-    for i in range(3):
-        p_start = today_d + timedelta(days=i * 5)
-        p_end = today_d + timedelta(days=(i + 1) * 5 - 1)
-        periods.append((p_start, p_end))
+    periods = [
+        (today_d + timedelta(days=i * 5),
+         today_d + timedelta(days=(i + 1) * 5 - 1))
+        for i in range(3)
+    ]
 
+    # ── Temperature deviation maps ────────────────────────────────────────────
     for p_start, p_end in periods:
-        with st.spinner(f"Generating map for {p_start} to {p_end}..."):
-            period_df = load_gridded_anomalies_multiday(map_region, p_start, p_end)
+        with st.spinner(f"Loading T anomaly  {p_start:%d %b} – {p_end:%d %b %Y}…"):
+            try:
+                period_df = load_gridded_anomalies_multiday(map_region, p_start, p_end)
+            except Exception as e:
+                st.error(f"Error: {e}")
+                continue
         if period_df.empty:
-            st.warning(f"No data for {p_start} to {p_end}")
+            st.warning(f"No temperature data for {p_start} – {p_end}")
             continue
 
         lats = np.sort(period_df['latitude'].unique())
         lons = np.sort(period_df['longitude'].unique())
-        grid_pivot = period_df.pivot_table(index='latitude', columns='longitude', values='anomaly')
-        grid_pivot = grid_pivot.reindex(index=lats, columns=lons)
-        data_2d = grid_pivot.values
+        pivot = period_df.pivot_table(index='latitude', columns='longitude', values='anomaly')
+        data_2d = pivot.reindex(index=lats, columns=lons).values
 
-        if has_cartopy:
-            fig_mpl, ax = plt.subplots(1, 1, figsize=(12, 7),
-                subplot_kw={'projection': ccrs.PlateCarree()})
-            ax.set_extent([bounds['lon_min'], bounds['lon_max'],
-                           bounds['lat_min'], bounds['lat_max']], crs=ccrs.PlateCarree())
-            ax.coastlines(linewidth=0.8)
-            ax.add_feature(cfeature.BORDERS, linewidth=0.5)
-            ax.add_feature(cfeature.OCEAN, color='#e6f2ff')
-            ax.add_feature(cfeature.LAND, color='#f5f5f5')
-            levels = np.linspace(-10, 10, 21)
-            cf = ax.contourf(lons, lats, data_2d, levels=levels,
-                             cmap='RdBu_r', extend='both', transform=ccrs.PlateCarree())
-            plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.08,
-                         fraction=0.046, label='T2m Anomaly (deg C)')
-        else:
-            fig_mpl, ax = plt.subplots(1, 1, figsize=(12, 7))
-            levels = np.linspace(-10, 10, 21)
-            cf = ax.contourf(lons, lats, data_2d, levels=levels,
-                             cmap='RdBu_r', extend='both')
-            ax.set_xlim(bounds['lon_min'], bounds['lon_max'])
-            ax.set_ylim(bounds['lat_min'], bounds['lat_max'])
-            plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.08,
-                         fraction=0.046, label='T2m Anomaly (deg C)')
-
-        ax.set_title(f"Temperature Deviation from Climatology\n"
-                     f"{map_region} - {p_start.strftime('%d %b')} to {p_end.strftime('%d %b %Y')}",
-                     fontsize=13)
-        plt.tight_layout()
+        fig_mpl = _make_map_fig(
+            lons, lats, data_2d, bounds,
+            title=f"Temperature Deviation from Climatology\n"
+                  f"{map_region}  ·  {p_start:%d %b} – {p_end:%d %b %Y}",
+            cmap='RdBu_r',
+            levels=np.linspace(-10, 10, 21),
+            cbar_label='T2m Anomaly (°C)',
+            has_cartopy=has_cartopy,
+        )
         st.pyplot(fig_mpl)
+        import matplotlib.pyplot as plt
         plt.close(fig_mpl)
 
-    # --- Precipitation Deviation Maps ---
+    # ── Precipitation deviation maps ──────────────────────────────────────────
     st.markdown("---")
     st.markdown("#### PRECIPITATION DEVIATION")
 
     for p_start, p_end in periods:
-        with st.spinner(f"Generating precip map for {p_start} to {p_end}..."):
-            precip_df = load_gridded_precip_deviation(map_region, p_start, p_end)
+        with st.spinner(f"Loading precip deviation  {p_start:%d %b} – {p_end:%d %b %Y}…"):
+            try:
+                precip_df = load_gridded_precip_deviation(map_region, p_start, p_end)
+            except Exception as e:
+                st.error(f"Error: {e}")
+                continue
         if precip_df.empty:
-            st.warning(f"No precipitation data for {p_start} to {p_end}")
+            st.warning(f"No precipitation data for {p_start} – {p_end}")
             continue
 
         lats = np.sort(precip_df['latitude'].unique())
         lons = np.sort(precip_df['longitude'].unique())
-        grid_pivot = precip_df.pivot_table(index='latitude', columns='longitude', values='anomaly')
-        grid_pivot = grid_pivot.reindex(index=lats, columns=lons)
-        data_2d = grid_pivot.values
+        pivot = precip_df.pivot_table(index='latitude', columns='longitude', values='anomaly')
+        data_2d = pivot.reindex(index=lats, columns=lons).values
 
-        if has_cartopy:
-            fig_mpl, ax = plt.subplots(1, 1, figsize=(12, 7),
-                subplot_kw={'projection': ccrs.PlateCarree()})
-            ax.set_extent([bounds['lon_min'], bounds['lon_max'],
-                           bounds['lat_min'], bounds['lat_max']], crs=ccrs.PlateCarree())
-            ax.coastlines(linewidth=0.8)
-            ax.add_feature(cfeature.BORDERS, linewidth=0.5)
-            ax.add_feature(cfeature.OCEAN, color='#e6f2ff')
-            ax.add_feature(cfeature.LAND, color='#f5f5f5')
-            levels = np.linspace(-8, 8, 17)
-            cf = ax.contourf(lons, lats, data_2d, levels=levels,
-                             cmap='BrBG', extend='both', transform=ccrs.PlateCarree())
-            plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.08,
-                         fraction=0.046, label='Precip Deviation (mm/day)')
-        else:
-            fig_mpl, ax = plt.subplots(1, 1, figsize=(12, 7))
-            levels = np.linspace(-8, 8, 17)
-            cf = ax.contourf(lons, lats, data_2d, levels=levels,
-                             cmap='BrBG', extend='both')
-            ax.set_xlim(bounds['lon_min'], bounds['lon_max'])
-            ax.set_ylim(bounds['lat_min'], bounds['lat_max'])
-            plt.colorbar(cf, ax=ax, orientation='horizontal', pad=0.08,
-                         fraction=0.046, label='Precip Deviation (mm/day)')
-
-        ax.set_title(f"Precipitation Deviation from Climatology\n"
-                     f"{map_region} - {p_start.strftime('%d %b')} to {p_end.strftime('%d %b %Y')}",
-                     fontsize=13)
-        plt.tight_layout()
+        fig_mpl = _make_map_fig(
+            lons, lats, data_2d, bounds,
+            title=f"Precipitation Deviation from Climatology\n"
+                  f"{map_region}  ·  {p_start:%d %b} – {p_end:%d %b %Y}",
+            cmap='BrBG',
+            levels=np.linspace(-8, 8, 17),
+            cbar_label='Precip Deviation (mm/day)',
+            has_cartopy=has_cartopy,
+        )
         st.pyplot(fig_mpl)
+        import matplotlib.pyplot as plt
         plt.close(fig_mpl)
-
-    # Legacy single-day map (unreachable, kept for reference)
-    import plotly.express as px
-    fig = px.scatter_geo(
-        grid_df,
-        lat='latitude',
-        lon='longitude',
-        color='anomaly',
-        color_continuous_scale='RdBu_r',
-        color_continuous_midpoint=0,
-        range_color=[-8, 8],
-        title=f"Temperature Anomaly (°C) — {map_region} — {target_date}",
-        projection='natural earth',
-    )
-    bounds = MAP_REGIONS[map_region]
-    fig.update_traces(marker=dict(size=6, symbol='square', line=dict(width=0)))
-    fig.update_layout(
-        height=600,
-        margin=dict(l=0, r=0, t=50, b=0),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='#0c1828',
-        font=dict(family='Inter, sans-serif', color='#e4eeff'),
-        geo=dict(
-            bgcolor='#0c1828',
-            landcolor='#1a2942',
-            showland=True,
-            showcountries=True,
-            countrycolor='rgba(255,255,255,0.2)',
-            coastlinecolor='rgba(255,255,255,0.3)',
-            showocean=True,
-            oceancolor='#07111f',
-            showlakes=False,
-            lonaxis=dict(range=[bounds['lon_min'], bounds['lon_max']]),
-            lataxis=dict(range=[bounds['lat_min'], bounds['lat_max']]),
-        ),
-        coloraxis_colorbar=dict(title="°C", len=0.6),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Summary statistics
-    st.markdown(f"**Grid points:** {len(grid_df)} | "
-                f"**Mean anomaly:** {grid_df['anomaly'].mean():+.1f}°C | "
-                f"**Max:** {grid_df['anomaly'].max():+.1f}°C | "
-                f"**Min:** {grid_df['anomaly'].min():+.1f}°C")
 
 
 # ─── Tab 4: City Detail ──────────────────────────────────────────────────────────
