@@ -147,7 +147,7 @@ def render_forecast_overview():
         if not p.empty:
             avg = p.groupby('date')['value'].mean().reset_index()
             fig.add_trace(go.Scatter(x=avg['date'], y=avg['value'], mode='lines', name=name, line=dict(color=color, width=2 if 'mean' in param else 1.5)))
-    fig.add_hline(y=BASE_TEMP, line_dash='dot', line_color='#22d3ee', annotation_text=f"CDD base ({BASE_TEMP}°C)", annotation_font_color='#22d3ee')
+    fig.add_hline(y=BASE_TEMP, line_dash='dot', line_color='#16a34a', annotation_text=f"CDD base ({BASE_TEMP}°C)", annotation_font_color='#16a34a')
     fig.update_layout(**PLOTLY_LAYOUT, title=dict(text=f"{region} — {model_choice}", font=dict(size=14)), xaxis_title="Date", yaxis_title="°C", height=400)
     st.plotly_chart(fig, use_container_width=True)
 
@@ -161,24 +161,24 @@ def render_forecast_overview():
 
 # ─── Tab 3: Anomaly Map ──────────────────────────────────────────────────────────
 
-# Dark matplotlib style matching the app's navy theme
-_MPL_DARK = {
-    'figure.facecolor': '#07111f',
-    'axes.facecolor':   '#0c1828',
-    'text.color':       '#e4eeff',
-    'axes.labelcolor':  '#e4eeff',
-    'xtick.color':      '#7d9ab8',
-    'ytick.color':      '#7d9ab8',
-    'axes.titlecolor':  '#e4eeff',
-    'axes.edgecolor':   'rgba(255,255,255,0.15)',
-    'grid.color':       'rgba(255,255,255,0.07)',
+# Light matplotlib style matching the app's professional light theme
+_MPL_STYLE = {
+    'figure.facecolor': '#f8fafc',
+    'axes.facecolor':   '#ffffff',
+    'text.color':       '#0f172a',
+    'axes.labelcolor':  '#374151',
+    'xtick.color':      '#6b7280',
+    'ytick.color':      '#6b7280',
+    'axes.titlecolor':  '#0f172a',
+    'axes.edgecolor':   '#e2e8f0',
+    'grid.color':       '#e2e8f0',
     'axes.titlesize':   13,
     'font.family':      'sans-serif',
 }
-_LAND_COLOR  = '#1a2942'
-_OCEAN_COLOR = '#07111f'
-_COAST_COLOR = (1, 1, 1, 0.35)
-_BORDER_COLOR = (1, 1, 1, 0.18)
+_LAND_COLOR   = '#e2e8f0'
+_OCEAN_COLOR  = '#dbeafe'
+_COAST_COLOR  = '#475569'
+_BORDER_COLOR = '#94a3b8'
 
 
 def _make_map_fig(lons, lats, data_2d, bounds, title, cmap, levels, cbar_label,
@@ -187,7 +187,7 @@ def _make_map_fig(lons, lats, data_2d, bounds, title, cmap, levels, cbar_label,
     import matplotlib.pyplot as plt
     import matplotlib.ticker as mticker
 
-    with plt.rc_context(_MPL_DARK):
+    with plt.rc_context(_MPL_STYLE):
         if has_cartopy:
             import cartopy.crs as ccrs
             import cartopy.feature as cfeature
@@ -211,11 +211,11 @@ def _make_map_fig(lons, lats, data_2d, bounds, title, cmap, levels, cbar_label,
                 cmap=cmap, extend='both', transform=ccrs.PlateCarree(), zorder=1,
             )
             gl = ax.gridlines(draw_labels=True, linewidth=0.4,
-                              color='rgba(255,255,255,0.1)', alpha=0.5)
+                              color='#e2e8f0', alpha=0.9)
             gl.top_labels = False
             gl.right_labels = False
-            gl.xlabel_style = {'color': '#7d9ab8', 'size': 8}
-            gl.ylabel_style = {'color': '#7d9ab8', 'size': 8}
+            gl.xlabel_style = {'color': '#6b7280', 'size': 8}
+            gl.ylabel_style = {'color': '#6b7280', 'size': 8}
         else:
             fig_mpl, ax = plt.subplots(1, 1, figsize=(12, 7))
             cf = ax.contourf(lons, lats, data_2d, levels=levels, cmap=cmap, extend='both')
@@ -226,9 +226,9 @@ def _make_map_fig(lons, lats, data_2d, bounds, title, cmap, levels, cbar_label,
 
         cbar = fig_mpl.colorbar(cf, ax=ax, orientation='horizontal',
                                 pad=0.06, fraction=0.046, label=cbar_label)
-        cbar.ax.xaxis.label.set_color('#e4eeff')
-        cbar.ax.tick_params(colors='#7d9ab8')
-        cbar.outline.set_edgecolor('rgba(255,255,255,0.15)')
+        cbar.ax.xaxis.label.set_color('#374151')
+        cbar.ax.tick_params(colors='#6b7280')
+        cbar.outline.set_edgecolor('#e2e8f0')
         ax.set_title(title, pad=10)
         plt.tight_layout()
     return fig_mpl
@@ -361,7 +361,7 @@ def render_city_detail():
         tmax = city_fcst[city_fcst['parameter'] == 't_max_2m_24h'].sort_values('date')
         if not tmin.empty and not tmax.empty:
             fig_temp.add_trace(go.Scatter(x=tmax['date'], y=tmax['value'], mode='lines', line=dict(width=0), showlegend=False))
-            fig_temp.add_trace(go.Scatter(x=tmin['date'], y=tmin['value'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(251,146,60,0.15)', name='T_min–T_max'))
+            fig_temp.add_trace(go.Scatter(x=tmin['date'], y=tmin['value'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(234,88,12,0.10)', name='T_min–T_max'))
     st.plotly_chart(fig_temp, use_container_width=True)
 
     if not data.empty:
