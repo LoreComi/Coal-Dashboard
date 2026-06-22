@@ -1,0 +1,19 @@
+command:
+  - streamlit
+  - run
+  - app_v2.py
+  - --server.port
+  - "8000"
+  - --server.address
+  - "0.0.0.0"
+
+env:
+  - name: DATABRICKS_SQL_WAREHOUSE_HTTP_PATH
+    description: "HTTP path of the SQL warehouse"
+    value: "/sql/1.0/warehouses/2f4ff6b7c65abb1a"
+
+resources:
+  - name: sql-warehouse
+    sql_warehouse:
+      id: "2f4ff6b7c65abb1a"
+      permission: CAN_USE
