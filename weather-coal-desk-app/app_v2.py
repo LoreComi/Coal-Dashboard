@@ -655,13 +655,24 @@ def render_hurricanes():
 
     # ── Data source status ────────────────────────────────────────────────────
     src_parts = []
+    has_errors = False
     for src, status in sources.items():
-        if status == 'ok':
+        if status in ('ok', 'skipped') or status.startswith('ok'):
             src_parts.append(f"**{src.upper()}** ✓")
-        elif status != 'skipped':
-            src_parts.append(f"**{src.upper()}** ✗ `{status}`")
+        else:
+            src_parts.append(f"**{src.upper()}** ✗")
+            has_errors = True
     if src_parts:
         st.caption("Sources: " + "  ·  ".join(src_parts))
+
+    if has_errors or not storms:
+        with st.expander("Data source diagnostics", expanded=not storms):
+            for src, status in sources.items():
+                if status not in ('ok', 'skipped') and not status.startswith('ok'):
+                    st.error(f"**{src.upper()}**: {status}")
+                else:
+                    st.success(f"**{src.upper()}**: {status}")
+            st.write(f"Total storms loaded: **{len(storms)}**")
 
     # ── Map (always shown, even with no active storms) ────────────────────────
     fig = go.Figure()

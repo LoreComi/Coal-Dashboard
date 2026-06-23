@@ -835,10 +835,10 @@ def load_hurricane_data() -> tuple:
     # Basin codes in WMO product IDs → human-readable name
     JTWC_BASIN = {'pn': 'W.Pacific', 'xs': 'S.Pacific', 'xo': 'S.Pacific',
                   'io': 'Indian Ocean', 'in': 'Indian Ocean'}
-    # Only JTWC-issued products (center = pgtw) for WP/SH, plus partner RSMCs for IO
+    # Regex for Apache directory listing links — filenames end with ..txt (two dots)
+    # e.g. wtpn31.pgtw..txt, wtxs31.pgtw..txt, wtin31.dems..txt
     FILE_RE = re.compile(
-        r'href="(wt(?:pn|xs|io|in|xo)\d{2,3}\.'
-        r'(?:pgtw|dems|fimp|bidep|rjtd)\.\.[^"]{0,30}\.txt)"',
+        r'href="(wt[a-z]{2}\d{2,3}\.[a-z]{4}\.\.txt)"',
         re.IGNORECASE,
     )
 
