@@ -24,6 +24,9 @@ TABLE_PRECIP_HIST = "dna_prod_silver.meteomatics.precipitation"
 TABLE_PRECIP_FCST = "dna_prod_silver.meteomatics.precipitation_forecast"
 CURVE_PRECIP_HIST = "precip_24h_mm_ecmwf_era5_p1d"
 CURVE_PRECIP_FCST = "precip_24h_mm_ecmwf_ens_p1d"
+# Precipitation climatology uses 'mix' model (1978–2025 long record)
+MODEL_PRECIP_CLIM = "mix"
+CURVE_PRECIP_CLIM = "precip_24h_mm_mix_p1d"
 
 # City coordinates (rounded to 0.5 deg grid)
 CITY_LOCATIONS: dict[str, dict] = {

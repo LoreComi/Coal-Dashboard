@@ -18,6 +18,7 @@ from _config import (
     BASE_TEMP, SEASON_START_MONTH, SEASON_START_DAY, HIST_START_YEAR, HIST_END_YEAR,
     TABLE_HIST, TABLE_FCST, CURVE_HIST, CURVE_FCST, MODEL_HIST, MODEL_FCST,
     TABLE_PRECIP_HIST, TABLE_PRECIP_FCST, CURVE_PRECIP_HIST, CURVE_PRECIP_FCST,
+    MODEL_PRECIP_CLIM, CURVE_PRECIP_CLIM,
 )
 
 # ─── Config ──────────────────────────────────────────────────────────────────────
@@ -259,7 +260,7 @@ def load_gridded_precip_deviation(map_region: str, start_date, end_date) -> pd.D
     clim_q = f"""
     SELECT AVG(value) as climatology, latitude, longitude
     FROM {TABLE_PRECIP_HIST}
-    WHERE model = '{MODEL_HIST}' AND curve_name = '{CURVE_PRECIP_HIST}'
+    WHERE model = '{MODEL_PRECIP_CLIM}' AND curve_name = '{CURVE_PRECIP_CLIM}'
       AND DAYOFYEAR(delivery_start) BETWEEN {doy_start} AND {doy_end}
       AND YEAR(delivery_start) BETWEEN {HIST_START_YEAR} AND {HIST_END_YEAR}
       AND latitude BETWEEN {bounds['lat_min']} AND {bounds['lat_max']}
@@ -631,7 +632,7 @@ def load_watershed_precip(region_name: str):
     SELECT DAYOFYEAR(delivery_start) as doy,
            AVG(value) as mean_precip, STDDEV(value) as std_precip
     FROM {TABLE_PRECIP_HIST}
-    WHERE model = '{MODEL_HIST}' AND curve_name = '{CURVE_PRECIP_HIST}'
+    WHERE model = '{MODEL_PRECIP_CLIM}' AND curve_name = '{CURVE_PRECIP_CLIM}'
       AND YEAR(delivery_start) BETWEEN {HIST_START_YEAR} AND {HIST_END_YEAR}
       AND {box}
     GROUP BY DAYOFYEAR(delivery_start) ORDER BY doy

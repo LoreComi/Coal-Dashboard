@@ -359,8 +359,8 @@ def _render_watershed_charts(label: str, hist_df: pd.DataFrame,
                 name='Forecast', marker_color='#ea580c', marker_line_width=0, opacity=0.75,
             ))
 
+        fig1.update_layout(**PLOTLY_LAYOUT)
         fig1.update_layout(
-            **PLOTLY_LAYOUT,
             title=dict(text=f"{label} — Daily Precip  (mm/day)", font=dict(size=12)),
             yaxis_title="mm/day", height=270, barmode='overlay',
             margin=dict(l=55, r=10, t=45, b=40),
@@ -398,8 +398,8 @@ def _render_watershed_charts(label: str, hist_df: pd.DataFrame,
             ))
 
         fig2.add_hline(y=0, line_color='#94a3b8', line_width=1)
+        fig2.update_layout(**PLOTLY_LAYOUT)
         fig2.update_layout(
-            **PLOTLY_LAYOUT,
             title=dict(text=f"{label} — Cumulative Departure from Normal", font=dict(size=12)),
             yaxis_title="Deviation (mm)", height=270,
             margin=dict(l=55, r=10, t=45, b=40),
@@ -554,16 +554,7 @@ def render_anomaly_map():
         except Exception as e:
             st.error(f"Three Gorges data: {e}")
 
-    # ── Gatun Lake — Panama Canal (always shown) ───────────────────────────────
-    st.markdown("---")
-    st.markdown("#### GATUN LAKE — PANAMA CANAL")
-    st.caption("Observed water levels + official ACP forecast · "
-               "source: Panama Canal Authority (evtms-rpts.pancanal.com)")
-    try:
-        gt_hist, gt_proj = load_gatun_lake_levels()
-        _render_gatun_lake_chart(gt_hist, gt_proj)
-    except Exception as e:
-        st.error(f"Gatun data unavailable: {e}")
+
 
 
 # ─── Tab 4: City Detail ──────────────────────────────────────────────────────────
