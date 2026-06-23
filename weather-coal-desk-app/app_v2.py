@@ -823,47 +823,57 @@ _BRIEF_CSS = """
 
 
 def _compute_cdd_summary() -> dict:
-    """Compute last-14-day CDD total vs normal for each DEFAULT region."""
+    """Compute last-14-day CDD total vs 2000-2024 normal for each DEFAULT region.
+
+    Uses load_current_year_cdd() for actual recent data (ERA5 + ECMWF forecast),
+    and the precomputed historical table for the normal baseline.
+    """
     today = pd.Timestamp.today().normalize()
-    window_start = today - pd.Timedelta(days=14)
     current_year = today.year
     season_start = pd.Timestamp(f"{current_year}-04-15")
+    window_start = today - pd.Timedelta(days=14)
     summary = {}
+
+    # Load all historical CDD once — filters per-region inside the loop
+    try:
+        precomp_hist = load_precomputed_historical()
+    except Exception:
+        precomp_hist = pd.DataFrame()
 
     for region in DEFAULT_REGIONS:
         try:
-            hist = load_historical(region)
-            if hist.empty:
+            # ── Recent CDD: ERA5 actuals + ECMWF forecast gap-fill ───────────────
+            current_df = load_current_year_cdd(region)
+            if current_df.empty:
                 continue
-            cdd_df = compute_region_cdd(hist, region)
-            normal_df = compute_normal(cdd_df)
-
-            recent = cdd_df[cdd_df["date"] >= window_start]
+            current_df = current_df.copy()
+            current_df["date"] = pd.to_datetime(current_df["date"])
+            recent = current_df[current_df["date"] >= window_start]
             if recent.empty:
                 continue
-            current_7d = float(recent["cdd"].sum())
+            current_14d = float(recent["cdd"].sum())
 
-            # Corresponding day-of-season range
-            dos_end = max(0, (today - season_start).days)
+            # ── Normal: cumulative difference from 2000-2024 climatology ─────────
+            normal_14d = 0.0
+            dos_end = max(1, (today - season_start).days)
             dos_start = max(0, dos_end - 14)
-            if not normal_df.empty:
-                norm_slice = normal_df[
-                    (normal_df["day_of_season"] >= dos_start) &
-                    (normal_df["day_of_season"] <= dos_end)
-                ]
-                # "mean" is cumulative CDD — take the difference to get 14-day increment
-                if len(norm_slice) > 1:
-                    normal_7d = float(norm_slice["mean"].iloc[-1] - norm_slice["mean"].iloc[0])
-                elif len(norm_slice) == 1:
-                    normal_7d = float(norm_slice["mean"].iloc[0])
-                else:
-                    normal_7d = 0.0
-            else:
-                normal_7d = 0.0
+
+            if not precomp_hist.empty and "region" in precomp_hist.columns and dos_end > 0:
+                region_hist = precomp_hist[precomp_hist["region"] == region][["date", "cdd"]].copy()
+                if not region_hist.empty:
+                    normal_df = compute_normal(region_hist)
+                    if not normal_df.empty:
+                        # compute_normal returns CUMULATIVE mean; take the 14-day increment
+                        row_end   = normal_df.loc[normal_df["day_of_season"] == dos_end,   "mean"].values
+                        row_start = normal_df.loc[normal_df["day_of_season"] == dos_start, "mean"].values
+                        if len(row_end) and len(row_start):
+                            normal_14d = float(row_end[0]) - float(row_start[0])
+                        elif len(row_end):
+                            normal_14d = float(row_end[0])
 
             summary[region] = {
-                "current_7d": round(current_7d, 1),
-                "anomaly":    round(current_7d - normal_7d, 1),
+                "current_7d": round(current_14d, 1),
+                "anomaly":    round(current_14d - normal_14d, 1),
             }
         except Exception:
             continue
