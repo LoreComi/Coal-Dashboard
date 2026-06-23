@@ -862,49 +862,46 @@ def load_hurricane_data() -> tuple:
                     continue
 
                 try:
-                    tr = _req.get(TGFTP_WMO + filename, headers=HEADERS, timeout=15)
+                    tr = _req.get(TGFTP_WMO + filename, headers=HEADERS, timeout=20)
                     if tr.status_code != 200:
                         continue
                     pt = tr.text
                 except Exception:
                     continue
 
-                # Skip cancellation or empty products
-                if any(k in pt.upper() for k in ('CANCEL', 'DISCONTINUED', 'NO WARNINGS')):
-                    continue
-
-                # Current position: "CENTER LOCATED NEAR 19.1N 124.8E"
-                pos = re.search(
-                    r'CENTER\s+LOCATED\s+NEAR\s+(\d+\.?\d*)\s*([NS])\s+(\d+\.?\d*)\s*([EW])',
-                    pt, re.IGNORECASE,
+                # tgftp JTWC format uses a compact T-series header, e.g.:
+                #   T000 191N 1248E 110   (current: lat=19.1N lon=124.8E wind=110kt)
+                #   T012 200N 1245E 100   (forecast +12h)
+                # Lat/lon are in tenths of degrees (3-digit lat, 4-digit lon).
+                # A valid warning always has T000; cancel/empty products don't.
+                T_RE = re.compile(
+                    r'^T(\d{3})\s+(\d{3})([NS])\s+(\d{4})([EW])\s+(\d+)',
+                    re.MULTILINE,
                 )
-                if not pos:
-                    pos = re.search(
-                        r'(?:POSITION[:\s]+|LOCATED\s+NEAR\s+)(\d+\.?\d*)\s*([NS])\s+(\d+\.?\d*)\s*([EW])',
-                        pt, re.IGNORECASE,
-                    )
-                if not pos:
+                t_lines = T_RE.findall(pt)
+                if not t_lines:
+                    continue  # not a position-bearing product
+
+                # T000 = current position and wind
+                hrs0, lat_raw, lat_h, lon_raw, lon_h, wind_raw = t_lines[0]
+                if int(hrs0) != 0:
                     continue
+                lat = float(lat_raw) / 10.0 * (1 if lat_h == 'N' else -1)
+                lon = float(lon_raw) / 10.0 * (1 if lon_h == 'E' else -1)
+                wind_kt = int(wind_raw)
 
-                lat_v, lat_h, lon_v, lon_h = pos.groups()
-                lat = float(lat_v) * (1 if lat_h.upper() == 'N' else -1)
-                lon = float(lon_v) * (1 if lon_h.upper() == 'E' else -1)
+                # Cross-check with text: "MAX SUSTAINED WINDS - 110 KT"
+                wm = re.search(r'MAX\s+SUSTAINED\s+WINDS\s*-\s*(\d+)\s+KT', pt, re.IGNORECASE)
+                if wm:
+                    wind_kt = int(wm.group(1))
 
-                # Wind: "MAXIMUM SUSTAINED WINDS: 110 KT"
-                wm = re.search(
-                    r'MAXIMUM\s+SUSTAINED\s+WINDS?[:\s]+(\d+)\s+KT', pt, re.IGNORECASE,
-                )
-                if not wm:
-                    wm = re.search(r'WINDS?[:\s]+(\d+)\s+KT', pt, re.IGNORECASE)
-                wind_kt = int(wm.group(1)) if wm else 0
-
-                # Pressure: "MINIMUM CENTRAL PRESSURE: 946 MB"
+                # Pressure: "MINIMUM CENTRAL PRESSURE AT 230600Z IS 946 MB"
                 pm = re.search(
-                    r'(?:MINIMUM\s+)?CENTRAL\s+PRESSURE[:\s]+(\d{3,4})\s+MB', pt, re.IGNORECASE,
+                    r'CENTRAL\s+PRESSURE\s+AT\s+\d+Z\s+IS\s+(\d{3,4})\s+MB', pt, re.IGNORECASE,
                 )
                 pressure = pm.group(1) if pm else 'N/A'
 
-                # Storm number e.g. "07W", "27P" — used as dedup key
+                # Storm number "07W" / "27P" — dedup key
                 id_m = re.search(
                     r'(?:TYPHOON|TROPICAL\s+STORM|CYCLONE|DEPRESSION)\s+(\d+[A-Z])',
                     pt, re.IGNORECASE,
@@ -919,13 +916,22 @@ def load_hurricane_data() -> tuple:
                     r'(?:TYPHOON|TROPICAL\s+STORM|CYCLONE|DEPRESSION)\s+\d+[A-Z]\s+\(([A-Z]{2,})\)',
                     pt, re.IGNORECASE,
                 )
-                if not nm:
-                    nm = re.search(r'\(([A-Z]{3,})\)', pt)
                 name = nm.group(1).capitalize() if nm else storm_num
 
-                forecast_track = _parse_nhc_forecast_positions(pt)
-                classification = 'TY' if wind_kt >= 64 else ('TS' if wind_kt >= 34 else 'TD')
+                # Forecast track from T-series lines (skip T000)
+                forecast_track = []
+                for hrs_s, la_r, la_h, lo_r, lo_h, wi_r in t_lines[1:]:
+                    hrs_i = int(hrs_s)
+                    if hrs_i == 0:
+                        continue
+                    forecast_track.append({
+                        'hours':   hrs_i,
+                        'lat':     float(la_r) / 10.0 * (1 if la_h == 'N' else -1),
+                        'lon':     float(lo_r) / 10.0 * (1 if lo_h == 'E' else -1),
+                        'wind_kt': int(wi_r),
+                    })
 
+                classification = 'TY' if wind_kt >= 64 else ('TS' if wind_kt >= 34 else 'TD')
                 storms.append({
                     'id':             f'jtwc-{storm_num.lower()}',
                     'name':           name,
