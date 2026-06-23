@@ -647,10 +647,21 @@ def render_hurricanes():
 
     with st.spinner("Fetching live hurricane data…"):
         try:
-            storms = load_hurricane_data()
+            result = load_hurricane_data()
+            storms, sources = result if isinstance(result, tuple) else (result, {})
         except Exception as e:
             st.error(f"Hurricane data unavailable: {e}")
             return
+
+    # ── Data source status ────────────────────────────────────────────────────
+    src_parts = []
+    for src, status in sources.items():
+        if status == 'ok':
+            src_parts.append(f"**{src.upper()}** ✓")
+        elif status != 'skipped':
+            src_parts.append(f"**{src.upper()}** ✗ `{status}`")
+    if src_parts:
+        st.caption("Sources: " + "  ·  ".join(src_parts))
 
     # ── Map (always shown, even with no active storms) ────────────────────────
     fig = go.Figure()

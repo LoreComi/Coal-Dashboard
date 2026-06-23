@@ -770,19 +770,22 @@ def _parse_nhc_forecast_positions(text: str) -> list:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def load_hurricane_data() -> list:
-    """Fetch active tropical cyclones from NHC (Atlantic / E.Pacific) and JTWC (W.Pacific / Indian Ocean / S.Pacific).
+def load_hurricane_data() -> tuple:
+    """Fetch active tropical cyclones from NHC + JTWC, with IBTrACS fallback.
 
-    Returns a list of storm dicts:
-        id, name, basin, lat, lon, wind_kt, pressure_mb, category,
-        classification, last_update, forecast_track (list of {hours, lat, lon, wind_kt})
+    Returns (storms, sources) where:
+      storms  — list of storm dicts (id, name, basin, lat, lon, wind_kt,
+                pressure_mb, category, classification, last_update, forecast_track)
+      sources — dict {'nhc': str, 'jtwc': str, 'ibtracs': str} with 'ok' or error msg
     """
     import re
+    import io
     from xml.etree import ElementTree as ET
     import requests as _req
 
     HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CDD-Dashboard/1.0)"}
     storms: list = []
+    sources: dict = {'nhc': 'skipped', 'jtwc': 'skipped', 'ibtracs': 'skipped'}
 
     # ── NHC: Atlantic + Eastern Pacific ────────────────────────────────────────
     try:
@@ -805,7 +808,6 @@ def load_hurricane_data() -> list:
                     'last_update':    s.get('lastUpdate', ''),
                     'forecast_track': [],
                 }
-                # Fetch 5-day forecast positions from advisory text
                 fcst_url = (s.get('forecastAdvisory') or {}).get('product', '')
                 if fcst_url:
                     try:
@@ -815,10 +817,16 @@ def load_hurricane_data() -> list:
                     except Exception:
                         pass
                 storms.append(storm)
-    except Exception:
-        pass
+            sources['nhc'] = 'ok'
+        else:
+            sources['nhc'] = f'HTTP {r.status_code}'
+    except Exception as e:
+        sources['nhc'] = str(e)
 
     # ── JTWC: Western Pacific, Indian Ocean, Southern Hemisphere ───────────────
+    # The JTWC RSS <description> is HTML containing href links to product .txt files.
+    # Position data is in the product text, not the RSS description itself.
+    jtwc_storms_added = 0
     try:
         r = _req.get("https://www.metoc.navy.mil/jtwc/rss/jtwc.rss",
                      headers=HEADERS, timeout=20)
@@ -829,14 +837,41 @@ def load_hurricane_data() -> list:
                 title = (item.findtext('title') or '').strip()
                 desc  = (item.findtext('description') or '').strip()
 
-                if not any(kw in title.upper() for kw in
+                title_up = title.upper()
+                if not any(kw in title_up for kw in
                            ['TROPICAL', 'TYPHOON', 'CYCLONE', 'DEPRESSION', 'STORM']):
                     continue
 
+                # Extract product .txt URL from the description HTML
+                # e.g. href='https://www.metoc.navy.mil/jtwc/products/wp0826web.txt'
+                href_m = re.search(r"href='([^']*web\.txt)'", desc, re.IGNORECASE)
+                if not href_m:
+                    href_m = re.search(r'href=["\']([^"\']*\.txt)["\']', desc, re.IGNORECASE)
+                if not href_m:
+                    continue
+                txt_url = href_m.group(1)
+                if not txt_url.startswith('http'):
+                    txt_url = 'https://www.metoc.navy.mil' + txt_url
+
+                try:
+                    tr = _req.get(txt_url, headers=HEADERS, timeout=15)
+                    if tr.status_code != 200:
+                        continue
+                    product_text = tr.text
+                except Exception:
+                    continue
+
+                # Current position from product text:
+                # "AT 23/0900Z, CENTER LOCATED NEAR 14.5N 141.8E"
                 pos = re.search(
-                    r'POSITION\s+(\d+\.\d+)\s*([NS])\s+(\d+\.\d+)\s*([EW])',
-                    desc, re.IGNORECASE,
+                    r'CENTER\s+LOCATED\s+NEAR\s+(\d+\.?\d*)\s*([NS])\s+(\d+\.?\d*)\s*([EW])',
+                    product_text, re.IGNORECASE,
                 )
+                if not pos:
+                    pos = re.search(
+                        r'(?:POSITION[:\s]+|LOCATED\s+NEAR\s+)(\d+\.?\d*)\s*([NS])\s+(\d+\.?\d*)\s*([EW])',
+                        product_text, re.IGNORECASE,
+                    )
                 if not pos:
                     continue
 
@@ -844,35 +879,117 @@ def load_hurricane_data() -> list:
                 lat = float(lat_v) * (1 if lat_h.upper() == 'N' else -1)
                 lon = float(lon_v) * (1 if lon_h.upper() == 'E' else -1)
 
-                wm  = re.search(r'(?:MAX\s+)?(?:SUSTAINED\s+)?WINDS?\s+(\d+)\s+KT',
-                                desc, re.IGNORECASE)
+                # Wind: "MAXIMUM SUSTAINED WINDS 35 KT"
+                wm = re.search(
+                    r'MAXIMUM\s+SUSTAINED\s+WINDS?\s+(\d+)\s+KT',
+                    product_text, re.IGNORECASE,
+                )
+                if not wm:
+                    wm = re.search(r'WINDS?\s+(\d+)\s+KT', product_text, re.IGNORECASE)
                 wind_kt = int(wm.group(1)) if wm else 0
 
-                nm = re.search(r'\(([A-Z][A-Z]+)\)', title)
-                name = nm.group(1) if nm else 'Unknown'
+                # Pressure: "MINIMUM CENTRAL PRESSURE 985 MB"
+                pm = re.search(r'CENTRAL\s+PRESSURE\s+(\d{3,4})\s+MB', product_text, re.IGNORECASE)
+                pressure = pm.group(1) if pm else 'N/A'
 
-                pfx = title[:4].upper()
-                if 'W' in pfx:
+                # Basin from URL: /wp####web.txt → WP, /io####web.txt → IO, /sh####web.txt → SH
+                url_m = re.search(r'/([a-z]{2})\d+', txt_url.lower())
+                basin_code = url_m.group(1).upper() if url_m else 'WP'
+                if basin_code == 'WP':
                     basin = 'W.Pacific'
-                elif any(c in pfx for c in ('A', 'B')):
+                elif basin_code == 'IO':
                     basin = 'Indian Ocean'
-                else:
+                elif basin_code == 'SH':
                     basin = 'S.Pacific'
+                else:
+                    basin = 'W.Pacific'
+
+                # Storm name from title: "TROPICAL STORM 08W (HIGOS) WARNING NR 004"
+                nm = re.search(r'\(([A-Z][A-Z]+)\)', title)
+                name = nm.group(1).capitalize() if nm else 'Unknown'
+
+                # Forecast track reuses the NHC parser — JTWC uses the same HR/Z/KT format
+                forecast_track = _parse_nhc_forecast_positions(product_text)
 
                 storms.append({
-                    'id':             re.sub(r'\s+', '', title[:6]).lower(),
+                    'id':             f'jtwc-{basin_code.lower()}-{name.lower()}',
                     'name':           name,
                     'basin':          basin,
                     'lat':            lat,
                     'lon':            lon,
                     'wind_kt':        wind_kt,
-                    'pressure_mb':    'N/A',
+                    'pressure_mb':    pressure,
                     'category':       _kt_to_category(wind_kt),
                     'classification': 'TY' if wind_kt >= 64 else ('TS' if wind_kt >= 34 else 'TD'),
                     'last_update':    '',
-                    'forecast_track': [],
+                    'forecast_track': forecast_track,
                 })
-    except Exception:
-        pass
+                jtwc_storms_added += 1
+            sources['jtwc'] = 'ok'
+        else:
+            sources['jtwc'] = f'HTTP {r.status_code}'
+    except Exception as e:
+        sources['jtwc'] = str(e)
 
-    return storms
+    # ── IBTrACS ACTIVE: fallback for W.Pacific/IO/SH if JTWC returned nothing ──
+    if jtwc_storms_added == 0:
+        try:
+            IBTRACS_URL = (
+                "https://www.ncei.noaa.gov/data/international-best-track-archive-for-climate-"
+                "stewardship-ibtracs/v04r00/access/csv/ibtracs.ACTIVE.list.v04r00.csv"
+            )
+            ir = _req.get(IBTRACS_URL, headers=HEADERS, timeout=30)
+            if ir.status_code == 200:
+                import pandas as _pd
+                df = _pd.read_csv(io.StringIO(ir.text), skiprows=[1], low_memory=False)
+                df['ISO_TIME'] = _pd.to_datetime(df['ISO_TIME'], errors='coerce')
+                df = df.dropna(subset=['ISO_TIME', 'LAT', 'LON'])
+                latest = df.sort_values('ISO_TIME').groupby('SID').last().reset_index()
+
+                BASIN_MAP = {
+                    'WP': 'W.Pacific', 'EP': 'E.Pacific', 'NA': 'Atlantic',
+                    'NI': 'Indian Ocean', 'SI': 'Indian Ocean',
+                    'SP': 'S.Pacific', 'SA': 'S.Atlantic',
+                }
+                NHC_BASINS = {'Atlantic', 'E.Pacific'}
+
+                for _, row in latest.iterrows():
+                    basin = BASIN_MAP.get(str(row.get('BASIN', '')).strip(), '')
+                    if not basin or basin in NHC_BASINS:
+                        continue  # NHC already covers Atlantic/E.Pacific
+
+                    name = str(row.get('NAME', '')).strip()
+                    if not name or name.upper() in ('UNNAMED', 'NOT_NAMED', 'NAN'):
+                        name = f"TC-{str(row.get('BASIN', ''))}"
+
+                    try:
+                        lat = float(row['LAT'])
+                        lon = float(row['LON'])
+                        raw_wind = str(row.get('WMO_WIND', '0')).strip()
+                        wind_kt = int(float(raw_wind)) if raw_wind not in ('', ' ', 'nan') else 0
+                    except (ValueError, TypeError):
+                        continue
+
+                    if abs(lat) > 90 or abs(lon) > 180:
+                        continue
+
+                    storms.append({
+                        'id':             str(row.get('SID', f'ibt-{name}')),
+                        'name':           name.capitalize(),
+                        'basin':          basin,
+                        'lat':            lat,
+                        'lon':            lon,
+                        'wind_kt':        wind_kt,
+                        'pressure_mb':    str(row.get('WMO_PRES', 'N/A')),
+                        'category':       _kt_to_category(wind_kt),
+                        'classification': 'TY' if wind_kt >= 64 else ('TS' if wind_kt >= 34 else 'TD'),
+                        'last_update':    str(row['ISO_TIME'])[:16],
+                        'forecast_track': [],
+                    })
+                sources['ibtracs'] = 'ok'
+            else:
+                sources['ibtracs'] = f'HTTP {ir.status_code}'
+        except Exception as e:
+            sources['ibtracs'] = str(e)
+
+    return storms, sources
