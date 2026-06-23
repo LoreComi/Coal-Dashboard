@@ -23,7 +23,7 @@ from _data_v2 import (
     load_current_year_cdd, load_gridded_anomalies, load_gridded_anomalies_multiday,
     load_gridded_precip_deviation, MAP_REGIONS,
     load_all_historical_cumulative, compute_similar_years,
-    load_watershed_precip, load_gatun_lake_levels,
+    load_watershed_precip, load_gatun_lake_levels, load_hurricane_data,
     THREE_GORGES_DAM,
 )
 from _charts import (
@@ -609,18 +609,192 @@ def render_city_detail():
             st.plotly_chart(fig_cum, use_container_width=True)
 
 
+# ─── Tab: Gatun Lake ──────────────────────────────────────────────────────────────
+def render_gatun_lake():
+    st.markdown("#### GATUN LAKE — PANAMA CANAL")
+    st.caption("Observed water levels + official ACP forecast · "
+               "source: Panama Canal Authority (evtms-rpts.pancanal.com)")
+    try:
+        gt_hist, gt_proj = load_gatun_lake_levels()
+        _render_gatun_lake_chart(gt_hist, gt_proj)
+    except Exception as e:
+        st.error(f"Gatun data unavailable: {e}")
+
+
+# ─── Tab: Hurricanes ─────────────────────────────────────────────────────────────
+
+_HURRICANE_COLORS = {
+    'TD':    '#9ca3af',
+    'TS':    '#16a34a',
+    'Cat 1': '#eab308',
+    'Cat 2': '#f97316',
+    'Cat 3': '#ef4444',
+    'Cat 4': '#b91c1c',
+    'Cat 5': '#7c3aed',
+}
+
+_BASIN_LABELS = {
+    'Atlantic':     'ATL',
+    'E.Pacific':    'EP',
+    'W.Pacific':    'WP',
+    'Indian Ocean': 'IO',
+    'S.Pacific':    'SP',
+}
+
+
+def render_hurricanes():
+    st.caption("Active tropical cyclones · NHC (Atlantic / E.Pacific) + JTWC (W.Pacific / Indian Ocean / S.Pacific)")
+
+    with st.spinner("Fetching live hurricane data…"):
+        try:
+            storms = load_hurricane_data()
+        except Exception as e:
+            st.error(f"Hurricane data unavailable: {e}")
+            return
+
+    # ── Map (always shown, even with no active storms) ────────────────────────
+    fig = go.Figure()
+
+    if storms:
+        for storm in storms:
+            color = _HURRICANE_COLORS.get(storm['category'], '#6b7280')
+
+            # Forecast track — dashed line + small dots
+            track = storm.get('forecast_track', [])
+            if track:
+                track_lons = [storm['lon']] + [p['lon'] for p in track]
+                track_lats = [storm['lat']] + [p['lat'] for p in track]
+                track_winds = [storm['wind_kt']] + [p['wind_kt'] for p in track]
+                track_hrs   = ['Now'] + [f"+{p['hours']}h" for p in track]
+                fig.add_trace(go.Scattergeo(
+                    lon=track_lons, lat=track_lats,
+                    mode='lines+markers',
+                    line=dict(color=color, width=1.5, dash='dot'),
+                    marker=dict(
+                        size=[12] + [6] * len(track),
+                        color=[_HURRICANE_COLORS.get(_kt_to_category_display(w), color)
+                               for w in track_winds],
+                        opacity=0.75,
+                    ),
+                    text=track_hrs,
+                    hovertemplate='%{text}<br>%{lat:.1f}°N %{lon:.1f}°E<extra></extra>',
+                    showlegend=False,
+                ))
+
+            # Current position — large marker with name label
+            wind = storm['wind_kt']
+            size = max(14, min(28, 10 + wind // 5))
+            fig.add_trace(go.Scattergeo(
+                lon=[storm['lon']], lat=[storm['lat']],
+                mode='markers+text',
+                marker=dict(
+                    size=size, color=color,
+                    symbol='circle',
+                    line=dict(width=2, color='#0f172a'),
+                ),
+                text=[storm['name']],
+                textposition='top center',
+                textfont=dict(size=10, color='#0f172a', family='Inter, sans-serif'),
+                name=f"{storm['name']}  {storm['category']}  {wind} kt  [{_BASIN_LABELS.get(storm['basin'], storm['basin'])}]",
+                hovertemplate=(
+                    f"<b>{storm['name']}</b>  ({storm['classification']})<br>"
+                    f"Basin: {storm['basin']}<br>"
+                    f"Category: {storm['category']}<br>"
+                    f"Wind: {wind} kt<br>"
+                    f"Pressure: {storm.get('pressure_mb', 'N/A')} mb<br>"
+                    f"Last update: {storm.get('last_update', 'N/A')}<extra></extra>"
+                ),
+            ))
+
+    fig.update_layout(
+        geo=dict(
+            projection_type='natural earth',
+            showland=True,        landcolor='#e2e8f0',
+            showocean=True,       oceancolor='#dbeafe',
+            showcountries=True,   countrycolor='#94a3b8',
+            showcoastlines=True,  coastlinecolor='#475569',
+            showlakes=False,
+            resolution=50,
+            showframe=False,
+        ),
+        paper_bgcolor='rgba(0,0,0,0)',
+        height=520,
+        margin=dict(l=0, r=0, t=0, b=0),
+        font=dict(family='Inter, sans-serif', color='#0f172a', size=11),
+        legend=dict(
+            bgcolor='rgba(255,255,255,0.92)',
+            font=dict(size=10, color='#374151'),
+            bordercolor='#e2e8f0',
+            borderwidth=1,
+            x=0.01, y=0.01, xanchor='left', yanchor='bottom',
+        ),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    if not storms:
+        st.info("No active tropical cyclones reported at this time.")
+        return
+
+    # ── Category legend ───────────────────────────────────────────────────────
+    cat_cols = st.columns(7)
+    for i, (cat, col) in enumerate(_HURRICANE_COLORS.items()):
+        with cat_cols[i]:
+            st.markdown(
+                f'<div style="background:{col};color:#fff;border-radius:6px;'
+                f'padding:4px 8px;text-align:center;font-size:0.75rem;'
+                f'font-weight:600;font-family:Inter,sans-serif">{cat}</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Details table ─────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### ACTIVE STORMS")
+    rows = []
+    for s in storms:
+        rows.append({
+            'Name':          s['name'],
+            'Basin':         s['basin'],
+            'Category':      s['category'],
+            'Wind (kt)':     s['wind_kt'],
+            'Pressure (mb)': s.get('pressure_mb', 'N/A'),
+            'Lat':           f"{s['lat']:.1f}°{'N' if s['lat'] >= 0 else 'S'}",
+            'Lon':           f"{abs(s['lon']):.1f}°{'E' if s['lon'] >= 0 else 'W'}",
+            'Forecast pts':  len(s.get('forecast_track', [])),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def _kt_to_category_display(wind_kt: int) -> str:
+    """Re-export for use inside render_hurricanes (avoid circular issue)."""
+    if wind_kt < 34:    return 'TD'
+    elif wind_kt < 64:  return 'TS'
+    elif wind_kt < 83:  return 'Cat 1'
+    elif wind_kt < 96:  return 'Cat 2'
+    elif wind_kt < 113: return 'Cat 3'
+    elif wind_kt < 137: return 'Cat 4'
+    else:               return 'Cat 5'
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     st.title("Coal Desk CDD")
-    tab1, tab2, tab3, tab4 = st.tabs(["CDD Dashboard", "Forecast Overview", "Maps & Watersheds", "City Detail"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Maps & Watersheds",
+        "CDD Dashboard",
+        "Gatun Lake",
+        "City Detail",
+        "Hurricanes",
+    ])
     with tab1:
-        render_cdd_dashboard()
-    with tab2:
-        render_forecast_overview()
-    with tab3:
         render_anomaly_map()
+    with tab2:
+        render_cdd_dashboard()
+    with tab3:
+        render_gatun_lake()
     with tab4:
         render_city_detail()
+    with tab5:
+        render_hurricanes()
 
 
 if __name__ == "__main__":

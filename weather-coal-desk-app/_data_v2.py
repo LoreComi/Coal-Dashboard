@@ -732,3 +732,147 @@ def load_gatun_lake_levels():
         proj_df = pd.DataFrame(columns=['date', 'level_ft'])
 
     return hist_df, proj_df
+
+
+# ─── Hurricane / Tropical Cyclone data ───────────────────────────────────────────
+
+def _kt_to_category(wind_kt: int) -> str:
+    """Saffir-Simpson / tropical cyclone category from 1-minute sustained wind (kt)."""
+    if wind_kt < 34:    return 'TD'
+    elif wind_kt < 64:  return 'TS'
+    elif wind_kt < 83:  return 'Cat 1'
+    elif wind_kt < 96:  return 'Cat 2'
+    elif wind_kt < 113: return 'Cat 3'
+    elif wind_kt < 137: return 'Cat 4'
+    else:               return 'Cat 5'
+
+
+def _parse_nhc_forecast_positions(text: str) -> list:
+    """Parse 5-day forecast positions from NHC forecast advisory text.
+
+    Handles lines like:
+        INIT  01/2100Z 25.6N  73.5W   115 KT
+         12H  02/0900Z 26.9N  75.5W   120 KT
+    """
+    import re
+    pattern = re.compile(
+        r'(INIT|\d+H)\s+\d+/\d{4}Z\s+(\d+\.\d+)([NS])\s+(\d+\.\d+)([EW])\s+(\d+)\s+KT',
+        re.IGNORECASE,
+    )
+    out = []
+    for m in pattern.finditer(text):
+        step, lat_v, lat_h, lon_v, lon_h, wind = m.groups()
+        hours = 0 if step.upper() == 'INIT' else int(step.upper().replace('H', ''))
+        lat = float(lat_v) * (1 if lat_h.upper() == 'N' else -1)
+        lon = float(lon_v) * (1 if lon_h.upper() == 'E' else -1)
+        out.append({'hours': hours, 'lat': lat, 'lon': lon, 'wind_kt': int(wind)})
+    return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_hurricane_data() -> list:
+    """Fetch active tropical cyclones from NHC (Atlantic / E.Pacific) and JTWC (W.Pacific / Indian Ocean / S.Pacific).
+
+    Returns a list of storm dicts:
+        id, name, basin, lat, lon, wind_kt, pressure_mb, category,
+        classification, last_update, forecast_track (list of {hours, lat, lon, wind_kt})
+    """
+    import re
+    from xml.etree import ElementTree as ET
+    import requests as _req
+
+    HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CDD-Dashboard/1.0)"}
+    storms: list = []
+
+    # ── NHC: Atlantic + Eastern Pacific ────────────────────────────────────────
+    try:
+        r = _req.get("https://www.nhc.noaa.gov/CurrentStorms.json",
+                     headers=HEADERS, timeout=20)
+        if r.status_code == 200:
+            for s in r.json().get('activeStorms', []):
+                sid      = s.get('id', '')
+                wind_kt  = int(s.get('intensity', 0))
+                storm = {
+                    'id':             sid,
+                    'name':           s.get('name', 'Unknown'),
+                    'basin':          'E.Pacific' if sid.startswith('ep') else 'Atlantic',
+                    'lat':            s.get('latitudeNumeric',  0.0),
+                    'lon':            s.get('longitudeNumeric', 0.0),
+                    'wind_kt':        wind_kt,
+                    'pressure_mb':    s.get('pressure', 'N/A'),
+                    'category':       _kt_to_category(wind_kt),
+                    'classification': s.get('classification', 'TD'),
+                    'last_update':    s.get('lastUpdate', ''),
+                    'forecast_track': [],
+                }
+                # Fetch 5-day forecast positions from advisory text
+                fcst_url = (s.get('forecastAdvisory') or {}).get('product', '')
+                if fcst_url:
+                    try:
+                        fr = _req.get(fcst_url, headers=HEADERS, timeout=15)
+                        if fr.status_code == 200:
+                            storm['forecast_track'] = _parse_nhc_forecast_positions(fr.text)
+                    except Exception:
+                        pass
+                storms.append(storm)
+    except Exception:
+        pass
+
+    # ── JTWC: Western Pacific, Indian Ocean, Southern Hemisphere ───────────────
+    try:
+        r = _req.get("https://www.metoc.navy.mil/jtwc/rss/jtwc.rss",
+                     headers=HEADERS, timeout=20)
+        if r.status_code == 200:
+            root = ET.fromstring(r.content)
+            channel = root.find('channel') or root
+            for item in channel.findall('item'):
+                title = (item.findtext('title') or '').strip()
+                desc  = (item.findtext('description') or '').strip()
+
+                if not any(kw in title.upper() for kw in
+                           ['TROPICAL', 'TYPHOON', 'CYCLONE', 'DEPRESSION', 'STORM']):
+                    continue
+
+                pos = re.search(
+                    r'POSITION\s+(\d+\.\d+)\s*([NS])\s+(\d+\.\d+)\s*([EW])',
+                    desc, re.IGNORECASE,
+                )
+                if not pos:
+                    continue
+
+                lat_v, lat_h, lon_v, lon_h = pos.groups()
+                lat = float(lat_v) * (1 if lat_h.upper() == 'N' else -1)
+                lon = float(lon_v) * (1 if lon_h.upper() == 'E' else -1)
+
+                wm  = re.search(r'(?:MAX\s+)?(?:SUSTAINED\s+)?WINDS?\s+(\d+)\s+KT',
+                                desc, re.IGNORECASE)
+                wind_kt = int(wm.group(1)) if wm else 0
+
+                nm = re.search(r'\(([A-Z][A-Z]+)\)', title)
+                name = nm.group(1) if nm else 'Unknown'
+
+                pfx = title[:4].upper()
+                if 'W' in pfx:
+                    basin = 'W.Pacific'
+                elif any(c in pfx for c in ('A', 'B')):
+                    basin = 'Indian Ocean'
+                else:
+                    basin = 'S.Pacific'
+
+                storms.append({
+                    'id':             re.sub(r'\s+', '', title[:6]).lower(),
+                    'name':           name,
+                    'basin':          basin,
+                    'lat':            lat,
+                    'lon':            lon,
+                    'wind_kt':        wind_kt,
+                    'pressure_mb':    'N/A',
+                    'category':       _kt_to_category(wind_kt),
+                    'classification': 'TY' if wind_kt >= 64 else ('TS' if wind_kt >= 34 else 'TD'),
+                    'last_update':    '',
+                    'forecast_track': [],
+                })
+    except Exception:
+        pass
+
+    return storms
