@@ -797,13 +797,60 @@ def _kt_to_category_display(wind_kt: int) -> str:
     else:               return 'Cat 5'
 
 
+# ─── Tab: Kaub Levels ────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _fetch_kaub_pdf() -> bytes:
+    import requests as _req
+    r = _req.get(
+        "https://vorhersage.bafg.de/14-Tage-Vorhersage/Kaub_14Tage.pdf",
+        headers={"User-Agent": "Mozilla/5.0 (compatible; CDD-Dashboard/1.0)"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.content
+
+
+def render_kaub_levels():
+    st.markdown("#### KAUB — RHINE WATER LEVEL FORECAST")
+    st.caption(
+        "14-day water level forecast at the Kaub gauge (Rhine km 546) · "
+        "Source: BfG — German Federal Institute of Hydrology"
+    )
+    with st.spinner("Loading Kaub forecast…"):
+        try:
+            pdf_bytes = _fetch_kaub_pdf()
+        except Exception as e:
+            st.error(f"Could not load Kaub forecast: {e}")
+            st.markdown(
+                "[Open Kaub 14-day forecast PDF directly ↗](https://vorhersage.bafg.de/14-Tage-Vorhersage/Kaub_14Tage.pdf)"
+            )
+            return
+
+    import base64 as _b64
+    b64 = _b64.b64encode(pdf_bytes).decode()
+    st.markdown(
+        f'<iframe src="data:application/pdf;base64,{b64}" '
+        f'width="100%" height="880" style="border:none;border-radius:8px;" '
+        f'type="application/pdf"></iframe>',
+        unsafe_allow_html=True,
+    )
+    st.download_button(
+        label="Download PDF",
+        data=pdf_bytes,
+        file_name="Kaub_14Tage.pdf",
+        mime="application/pdf",
+    )
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     st.title("Coal Desk CDD")
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "Maps & Watersheds",
         "CDD Dashboard",
         "Gatun Lake",
+        "Kaub Levels",
         "City Detail",
         "Hurricanes",
     ])
@@ -814,8 +861,10 @@ def main():
     with tab3:
         render_gatun_lake()
     with tab4:
-        render_city_detail()
+        render_kaub_levels()
     with tab5:
+        render_city_detail()
+    with tab6:
         render_hurricanes()
 
 
