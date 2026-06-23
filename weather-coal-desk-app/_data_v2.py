@@ -1037,46 +1037,145 @@ def load_hurricane_data() -> tuple:
         except Exception as e:
             sources['ibtracs'] = str(e)
 
-    # ── ECMWF AIFS TC tracks (if eccodes available) ───────────────────────────
-    # ECMWF Open Data (data.ecmwf.int) provides a BUFR file with tropical
-    # forecast tracks from the AIFS AI model (GraphCast-based). Decoding
-    # requires the eccodes Python library. If not installed this block is a no-op.
+    # ── ECMWF AIFS TC tracks (requires: pip install eccodes) ─────────────────
+    # data.ecmwf.int publishes AIFS (AI model) tropical forecast BUFR files
+    # with no authentication. Each BUFR message = one TC; arrays inside give
+    # analysis + 360h forecast positions.
     try:
         import eccodes as _ec  # type: ignore
         import datetime as _dt
+        import tempfile as _tmp
+        import os as _os
+
+        # BUFR missing-value sentinels used by eccodes
+        _DBL_MISS = _ec.CODES_MISSING_DOUBLE
+        _INT_MISS = _ec.CODES_MISSING_LONG
+
+        def _ec_get(mid, key, default=None):
+            try:
+                v = _ec.codes_get(mid, key)
+                return default if (v == _DBL_MISS or v == _INT_MISS) else v
+            except Exception:
+                return default
+
+        def _ec_arr(mid, key):
+            try:
+                return [v for v in _ec.codes_get_array(mid, key)
+                        if v != _DBL_MISS and v != _INT_MISS and abs(v) < 1e30]
+            except Exception:
+                return []
 
         today_str = _dt.date.today().strftime('%Y%m%d')
-        bufr_url = (
-            f"https://data.ecmwf.int/forecasts/{today_str}/00z/"
-            f"aifs-single/0p25/oper/{today_str}000000-360h-oper-tf.bufr"
-        )
-        br = _req.get(bufr_url, headers=HEADERS, timeout=30)
-        if br.status_code == 200:
-            buf_bytes = br.content
-            msgs = []
-            buf_id = _ec.codes_bufr_new_from_samples('BUFR4')
-            _ec.codes_set(buf_id, 'unpack', 1)
-            # Process each BUFR message
-            ptr = 0
-            while ptr < len(buf_bytes):
-                try:
-                    msg_id = _ec.codes_bufr_new_from_message(buf_bytes[ptr:])
-                    _ec.codes_set(msg_id, 'unpack', 1)
-                    # Extract TC name, lat, lon, wind
-                    tc_name = _ec.codes_get(msg_id, 'stormIdentifier', default='')
-                    lat_e = _ec.codes_get(msg_id, 'latitude', default=None)
-                    lon_e = _ec.codes_get(msg_id, 'longitude', default=None)
-                    wind_e = _ec.codes_get(msg_id, 'windSpeedAt10M', default=0)
-                    if tc_name and lat_e is not None:
-                        msgs.append({'name': str(tc_name), 'lat': lat_e,
-                                     'lon': lon_e, 'wind_kt': int((wind_e or 0) / 0.514)})
-                    _ec.codes_release(msg_id)
-                except Exception:
+        # Try 00z first, fall back to 12z (previous run)
+        bufr_url = None
+        for run_h, run_sfx in (('00z', '00'), ('12z', '12')):
+            _u = (f"https://data.ecmwf.int/forecasts/{today_str}/{run_h}/"
+                  f"aifs-single/0p25/oper/{today_str}{run_sfx}0000-360h-oper-tf.bufr")
+            try:
+                _r = _req.get(_u, headers=HEADERS, timeout=5)
+                if _r.status_code == 200:
+                    bufr_url = _u
+                    bufr_content = _r.content
                     break
-                ptr += 4
-            sources['ecmwf_aifs'] = f'ok ({len(msgs)} TC msgs)'
+            except Exception:
+                pass
+
+        if bufr_url is None:
+            sources['ecmwf_aifs'] = 'BUFR file not found (try again after 06:00 UTC)'
+        else:
+            tmp_fd, tmp_path = _tmp.mkstemp(suffix='.bufr')
+            aifs_added = 0
+            try:
+                _os.write(tmp_fd, bufr_content)
+                _os.close(tmp_fd)
+
+                with open(tmp_path, 'rb') as _f:
+                    while True:
+                        msg = _ec.codes_bufr_new_from_file(_f)
+                        if msg is None:
+                            break
+                        try:
+                            _ec.codes_set(msg, 'unpack', 1)
+
+                            # Storm name — try several key variants
+                            name_raw = (
+                                _ec_get(msg, 'stormName')
+                                or _ec_get(msg, 'nameOfTheCyclonicSystem')
+                                or _ec_get(msg, 'stormIdentifier')
+                                or 'UNKNOWN'
+                            )
+                            name_str = str(name_raw).strip().capitalize()
+
+                            # Lat/lon arrays (analysis + forecast positions)
+                            lats = _ec_arr(msg, 'latitude')
+                            lons = _ec_arr(msg, 'longitude')
+                            if not lats or not lons or len(lats) < 1:
+                                continue
+
+                            # Wind speed arrays — BUFR may store in m/s
+                            winds_raw = (
+                                _ec_arr(msg, 'maximumWindSpeed')
+                                or _ec_arr(msg, 'windSpeed')
+                                or _ec_arr(msg, 'maximumWindGustSpeed')
+                            )
+                            # Convert m/s → kt if values look like m/s (< 150)
+                            if winds_raw and max(winds_raw) < 150:
+                                winds_kt = [w / 0.514444 for w in winds_raw]
+                            else:
+                                winds_kt = list(winds_raw) if winds_raw else []
+
+                            # Pressure arrays (Pa → hPa)
+                            pres_raw = (
+                                _ec_arr(msg, 'minimumPressureAtMeanSeaLevel')
+                                or _ec_arr(msg, 'pressure')
+                                or _ec_arr(msg, 'pressureReducedToMeanSeaLevel')
+                            )
+                            pres_hpa = [p / 100 if p > 10000 else p for p in pres_raw]
+
+                            # Time offsets in hours (index 0 = analysis = 0h)
+                            time_offsets = _ec_arr(msg, 'timePeriod') or list(range(0, len(lats) * 12, 12))
+
+                            lat0 = float(lats[0])
+                            lon0 = float(lons[0])
+                            wkt0 = int(winds_kt[0]) if winds_kt else 0
+                            pr0 = f"{int(pres_hpa[0])}" if pres_hpa else 'N/A'
+
+                            track = []
+                            for i in range(1, len(lats)):
+                                if abs(lats[i]) > 90 or abs(lons[i]) > 180:
+                                    continue
+                                track.append({
+                                    'hours':   int(time_offsets[i]) if i < len(time_offsets) else i * 12,
+                                    'lat':     float(lats[i]),
+                                    'lon':     float(lons[i]),
+                                    'wind_kt': int(winds_kt[i]) if i < len(winds_kt) else 0,
+                                })
+
+                            storms.append({
+                                'id':             f'aifs-{name_str.lower()[:8]}',
+                                'name':           f'{name_str} ★AIFS',
+                                'basin':          'AI (ECMWF)',
+                                'lat':            lat0,
+                                'lon':            lon0,
+                                'wind_kt':        wkt0,
+                                'pressure_mb':    pr0,
+                                'category':       _kt_to_category(wkt0),
+                                'classification': 'AI',
+                                'last_update':    'ECMWF AIFS',
+                                'forecast_track': track,
+                            })
+                            aifs_added += 1
+
+                        finally:
+                            _ec.codes_release(msg)
+
+            finally:
+                _os.unlink(tmp_path)
+
+            sources['ecmwf_aifs'] = f'ok ({aifs_added} TC tracks from AIFS AI model)'
+
     except ImportError:
-        sources['ecmwf_aifs'] = 'eccodes not installed'
+        sources['ecmwf_aifs'] = 'eccodes not installed — add: pip install eccodes'
     except Exception as e:
         sources['ecmwf_aifs'] = str(e)
 
