@@ -11,9 +11,30 @@ env:
   - name: DATABRICKS_SQL_WAREHOUSE_HTTP_PATH
     description: "HTTP path of the SQL warehouse"
     value: "/sql/1.0/warehouses/2f4ff6b7c65abb1a"
+  - name: AZURE_TENANT_ID
+    valueFrom: secret-3
+  - name: AZURE_CLIENT_ID
+    valueFrom: secret
+  - name: AZURE_CLIENT_SECRET
+    valueFrom: secret-2
 
 resources:
   - name: sql-warehouse
     sql_warehouse:
       id: "2f4ff6b7c65abb1a"
       permission: CAN_USE
+  - name: secret
+    secret:
+      scope: "commodity-news-secrets"
+      key: "azure-client-id"
+      permission: READ
+  - name: secret-2
+    secret:
+      scope: "commodity-news-secrets"
+      key: "azure-client-secret"
+      permission: READ
+  - name: secret-3
+    secret:
+      scope: "commodity-news-secrets"
+      key: "azure-tenant-id"
+      permission: READ

@@ -851,7 +851,13 @@ def _compute_cdd_summary() -> dict:
                     (normal_df["day_of_season"] >= dos_start) &
                     (normal_df["day_of_season"] <= dos_end)
                 ]
-                normal_7d = float(norm_slice["mean"].sum()) if not norm_slice.empty else 0.0
+                # "mean" is cumulative CDD — take the difference to get 14-day increment
+                if len(norm_slice) > 1:
+                    normal_7d = float(norm_slice["mean"].iloc[-1] - norm_slice["mean"].iloc[0])
+                elif len(norm_slice) == 1:
+                    normal_7d = float(norm_slice["mean"].iloc[0])
+                else:
+                    normal_7d = 0.0
             else:
                 normal_7d = 0.0
 
