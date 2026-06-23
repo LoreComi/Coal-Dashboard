@@ -643,7 +643,7 @@ _BASIN_LABELS = {
 
 
 def render_hurricanes():
-    st.caption("Active tropical cyclones · NHC (Atlantic / E.Pacific) + JTWC (W.Pacific / Indian Ocean / S.Pacific)")
+    st.caption("Active tropical cyclones · NHC (Atlantic / E.Pacific) + JTWC via NOAA tgftp (W.Pacific / Indian Ocean / S.Pacific) · ECMWF AIFS if eccodes installed")
 
     with st.spinner("Fetching live hurricane data…"):
         try:
