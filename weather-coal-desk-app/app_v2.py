@@ -797,6 +797,241 @@ def _kt_to_category_display(wind_kt: int) -> str:
     else:               return 'Cat 5'
 
 
+# ─── Tab: Coal Brief ─────────────────────────────────────────────────────────────
+
+_BRIEF_CSS = """
+<style>
+.brief-box {
+    background: #f8fafc;
+    border: 1px solid rgba(15,23,42,0.10);
+    border-left: 3px solid #1d4ed8;
+    border-radius: 10px;
+    padding: 18px 22px;
+    margin: 8px 0 16px;
+}
+.brief-bullet {
+    padding: 6px 0;
+    font-size: 0.91rem;
+    color: #0f172a;
+    line-height: 1.55;
+    border-bottom: 1px solid rgba(15,23,42,0.06);
+}
+.brief-bullet:last-child { border-bottom: none; }
+.brief-bullet b { color: #1d4ed8; }
+</style>
+"""
+
+
+def _compute_cdd_summary() -> dict:
+    """Compute last-14-day CDD total vs normal for each DEFAULT region."""
+    today = pd.Timestamp.today().normalize()
+    window_start = today - pd.Timedelta(days=14)
+    current_year = today.year
+    season_start = pd.Timestamp(f"{current_year}-04-15")
+    summary = {}
+
+    for region in DEFAULT_REGIONS:
+        try:
+            hist = load_historical(region)
+            if hist.empty:
+                continue
+            cdd_df = compute_region_cdd(hist, region)
+            normal_df = compute_normal(cdd_df)
+
+            recent = cdd_df[cdd_df["date"] >= window_start]
+            if recent.empty:
+                continue
+            current_7d = float(recent["cdd"].sum())
+
+            # Corresponding day-of-season range
+            dos_end = max(0, (today - season_start).days)
+            dos_start = max(0, dos_end - 14)
+            if not normal_df.empty:
+                norm_slice = normal_df[
+                    (normal_df["day_of_season"] >= dos_start) &
+                    (normal_df["day_of_season"] <= dos_end)
+                ]
+                normal_7d = float(norm_slice["mean"].sum()) if not norm_slice.empty else 0.0
+            else:
+                normal_7d = 0.0
+
+            summary[region] = {
+                "current_7d": round(current_7d, 1),
+                "anomaly":    round(current_7d - normal_7d, 1),
+            }
+        except Exception:
+            continue
+
+    return summary
+
+
+def _get_az_credentials() -> tuple[str, str, str] | tuple[None, None, None]:
+    """Try Databricks secrets → st.secrets → environment variables."""
+    import os
+
+    # 1. Databricks secrets (dbutils available in Databricks runtimes)
+    try:
+        t = dbutils.secrets.get("axpo", "azure_tenant_id")   # type: ignore[name-defined]
+        c = dbutils.secrets.get("axpo", "azure_client_id")   # type: ignore[name-defined]
+        s = dbutils.secrets.get("axpo", "azure_client_secret")  # type: ignore[name-defined]
+        if t and c and s:
+            return t, c, s
+    except Exception:
+        pass
+
+    # 2. Databricks SDK (Databricks Apps context)
+    try:
+        from databricks.sdk.runtime import dbutils as sdk_dbutils
+        t = sdk_dbutils.secrets.get("axpo", "azure_tenant_id")
+        c = sdk_dbutils.secrets.get("axpo", "azure_client_id")
+        s = sdk_dbutils.secrets.get("axpo", "azure_client_secret")
+        if t and c and s:
+            return t, c, s
+    except Exception:
+        pass
+
+    # 3. Streamlit secrets
+    try:
+        t = st.secrets["azure_tenant_id"]
+        c = st.secrets["azure_client_id"]
+        s = st.secrets["azure_client_secret"]
+        if t and c and s:
+            return t, c, s
+    except Exception:
+        pass
+
+    # 4. Environment variables
+    t = os.environ.get("AZURE_TENANT_ID")
+    c = os.environ.get("AZURE_CLIENT_ID")
+    s = os.environ.get("AZURE_CLIENT_SECRET")
+    if t and c and s:
+        return t, c, s
+
+    return None, None, None
+
+
+def render_coal_brief():
+    st.markdown("#### AI COAL MARKET BRIEF")
+    st.caption(
+        "5-agent AI analysis: storm supply risk · Rhine/Kaub transport · "
+        "European CDD · China Three Gorges hydro → coal market outlook"
+    )
+    st.markdown(_BRIEF_CSS, unsafe_allow_html=True)
+
+    tenant_id, client_id, client_secret = _get_az_credentials()
+    if not all([tenant_id, client_id, client_secret]):
+        st.warning(
+            "Azure OpenAI credentials not found. "
+            "Configure `azure_tenant_id`, `azure_client_id`, `azure_client_secret` "
+            "in Databricks secrets (scope: **axpo**), `st.secrets`, or environment variables."
+        )
+        return
+
+    col_txt, col_btn = st.columns([5, 1])
+    with col_btn:
+        generate = st.button("Generate", type="primary", key="coal_brief_btn")
+
+    cached = st.session_state.get("coal_brief_result")
+
+    if not generate and not cached:
+        st.info(
+            "Click **Generate** to run the 5-agent AI analysis. "
+            "Each run makes 5 Azure OpenAI calls (~15-25 seconds)."
+        )
+        with st.expander("What each agent uses"):
+            st.markdown("""
+| Agent | Data source |
+|---|---|
+| Hurricane | NHC + JTWC live storm data (already loaded by this app) |
+| Kaub | Live Rhine gauge from Pegelonline (German Federal Waterways) |
+| CDD | Databricks CDD anomalies per European region |
+| China hydro | Three Gorges catchment precipitation from Databricks ERA5/ECMWF |
+| Synthesis | Combines all four findings into 4-6 coal trader bullets |
+""")
+        return
+
+    if generate:
+        progress = st.empty()
+
+        def _prog(msg: str):
+            progress.caption(f"⟳  {msg}")
+
+        try:
+            _prog("Loading storm data…")
+            storms_result = load_hurricane_data()
+            storms, _ = storms_result if isinstance(storms_result, tuple) else (storms_result, {})
+
+            _prog("Computing European CDD anomalies…")
+            cdd_summary = {}
+            try:
+                cdd_summary = _compute_cdd_summary()
+            except Exception:
+                pass
+
+            _prog("Loading Three Gorges watershed precipitation…")
+            tg_hist, tg_fcst, tg_clim = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+            try:
+                tg_hist, tg_fcst, tg_clim = load_watershed_precip("Three Gorges")
+            except Exception:
+                pass
+
+            from _ai_coal_brief import generate_coal_brief as _run
+
+            result = _run(
+                storms=storms,
+                three_gorges_hist=tg_hist,
+                three_gorges_fcst=tg_fcst,
+                three_gorges_clim=tg_clim,
+                cdd_summary=cdd_summary,
+                azure_tenant_id=tenant_id,
+                azure_client_id=client_id,
+                azure_client_secret=client_secret,
+                progress_cb=_prog,
+            )
+            st.session_state["coal_brief_result"] = result
+            cached = result
+
+        except Exception as exc:
+            progress.empty()
+            st.error(f"Brief generation failed: {exc}")
+            with st.expander("Error details"):
+                import traceback
+                st.code(traceback.format_exc())
+            return
+
+        progress.empty()
+
+    if not cached:
+        return
+
+    from _ai_coal_brief import brief_to_html_bullets
+
+    kaub_str = (f" · Kaub {cached['kaub_level_cm']:.0f} cm"
+                if cached.get("kaub_level_cm") else "")
+    st.markdown(f"**Coal Market Brief**{kaub_str} · {cached['generated_at']}")
+
+    st.markdown(
+        f'<div class="brief-box">{brief_to_html_bullets(cached["synthesis"])}</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+    st.markdown("#### SPECIALIST AGENT OUTPUTS")
+    c1, c2 = st.columns(2)
+    with c1:
+        with st.expander("Hurricane / storm supply risk"):
+            st.markdown(cached["hurricane"])
+        with st.expander("European CDD / gas-coal switching"):
+            st.markdown(cached["cdd"])
+    with c2:
+        kaub_exp = (f"Rhine / Kaub — {cached['kaub_level_cm']:.0f} cm"
+                    if cached.get("kaub_level_cm") else "Rhine / Kaub")
+        with st.expander(kaub_exp):
+            st.markdown(cached["kaub"])
+        with st.expander("China Three Gorges hydro"):
+            st.markdown(cached["china_hydro"])
+
+
 # ─── Tab: Kaub Levels ────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -846,13 +1081,14 @@ def render_kaub_levels():
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     st.title("Coal Desk CDD")
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "Maps & Watersheds",
         "CDD Dashboard",
         "Gatun Lake",
         "Kaub Levels",
         "City Detail",
         "Hurricanes",
+        "Coal Brief",
     ])
     with tab1:
         render_anomaly_map()
@@ -866,6 +1102,8 @@ def main():
         render_city_detail()
     with tab6:
         render_hurricanes()
+    with tab7:
+        render_coal_brief()
 
 
 if __name__ == "__main__":
