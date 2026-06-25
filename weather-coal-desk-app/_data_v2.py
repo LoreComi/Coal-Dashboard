@@ -974,18 +974,26 @@ def load_hurricane_data() -> tuple:
                 df['ISO_TIME'] = _pd.to_datetime(df['ISO_TIME'], errors='coerce')
                 df = df.dropna(subset=['ISO_TIME', 'LAT', 'LON'])
 
-                # Adaptive staleness filter:
-                #   JTWC found storms → 6h cutoff (IBTrACS just fills gaps; tight
-                #   window avoids picking up dissipated systems JTWC has dropped)
-                #   JTWC found nothing → 48h fallback (broader safety net)
-                ibt_hours = 6 if jtwc_storms_added > 0 else 48
-                cutoff = _pd.Timestamp.utcnow().tz_localize(None) - _pd.Timedelta(hours=ibt_hours)
-                df = df[df['ISO_TIME'] >= cutoff]
-                if df.empty:
-                    sources['ibtracs'] = 'ok (no recent storms)'
-                    return storms, sources
-
+                # Get the most recent synoptic record per storm
                 latest = df.sort_values('ISO_TIME').groupby('SID').last().reset_index()
+
+                # Date-based currency filter: only keep storms whose MOST RECENT
+                # IBTrACS record is from today (UTC). A storm whose last fix was
+                # yesterday or earlier has dissipated and IBTrACS hasn't cleaned it
+                # out of the ACTIVE file yet.
+                # Fallback: if IBTrACS has no today records at all (e.g. lag / outage),
+                # accept yesterday's records rather than showing nothing.
+                today_utc = _pd.Timestamp.utcnow().normalize()  # 00:00 UTC today
+                latest_today = latest[latest['ISO_TIME'] >= today_utc]
+                if not latest_today.empty:
+                    latest = latest_today
+                else:
+                    yesterday_utc = today_utc - _pd.Timedelta(days=1)
+                    latest = latest[latest['ISO_TIME'] >= yesterday_utc]
+
+                if latest.empty:
+                    sources['ibtracs'] = 'ok (no current storms)'
+                    return storms, sources
 
                 BASIN_MAP = {
                     'WP': 'W.Pacific', 'EP': 'E.Pacific', 'NA': 'Atlantic',
