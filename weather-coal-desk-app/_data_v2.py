@@ -977,23 +977,21 @@ def load_hurricane_data() -> tuple:
                 # Get the most recent synoptic record per storm
                 latest = df.sort_values('ISO_TIME').groupby('SID').last().reset_index()
 
-                # Date-based currency filter: only keep storms whose MOST RECENT
-                # IBTrACS record is from today (UTC). A storm whose last fix was
-                # yesterday or earlier has dissipated and IBTrACS hasn't cleaned it
-                # out of the ACTIVE file yet.
-                # Fallback: if IBTrACS has no today records at all (e.g. lag / outage),
-                # accept yesterday's records rather than showing nothing.
-                today_utc = _pd.Timestamp.utcnow().normalize()  # 00:00 UTC today
-                latest_today = latest[latest['ISO_TIME'] >= today_utc]
+                # Date-based currency filter.
+                # Compare Python date objects to avoid tz-aware vs tz-naive issues.
+                # IBTrACS synoptic times are UTC; Timestamp.utcnow().date() is also UTC.
+                # A storm is "current" if its last fix is from today; if IBTrACS hasn't
+                # updated yet today (rare outage), accept yesterday as a fallback.
+                today_date = _pd.Timestamp.utcnow().date()
+                yesterday_date = today_date - _pd.Timedelta(days=1)
+                latest_today = latest[latest['ISO_TIME'].dt.date >= today_date]
                 if not latest_today.empty:
                     latest = latest_today
                 else:
-                    yesterday_utc = today_utc - _pd.Timedelta(days=1)
-                    latest = latest[latest['ISO_TIME'] >= yesterday_utc]
+                    latest = latest[latest['ISO_TIME'].dt.date >= yesterday_date]
 
                 if latest.empty:
                     sources['ibtracs'] = 'ok (no current storms)'
-                    return storms, sources
 
                 BASIN_MAP = {
                     'WP': 'W.Pacific', 'EP': 'E.Pacific', 'NA': 'Atlantic',
