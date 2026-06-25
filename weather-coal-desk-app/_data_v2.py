@@ -870,35 +870,43 @@ def load_hurricane_data() -> tuple:
                 except Exception:
                     continue
 
-                # tgftp JTWC format uses a compact T-series header, e.g.:
-                #   T000 191N 1248E 110   (current: lat=19.1N lon=124.8E wind=110kt)
-                #   T012 200N 1245E 100   (forecast +12h)
-                # Lat/lon are in tenths of degrees. Lat is 2-3 digits (storms at
-                # low latitudes like 5°N = raw 50 may lack a leading zero).
-                # Lon is 3-4 digits: Indian Ocean storms at lon < 100°E give 3-digit
-                # values (e.g. 85°E = 850). Using \d{2,3} / \d{3,4} handles both.
-                T_RE = re.compile(
-                    r'^T(\d{3})\s+(\d{2,3})([NS])\s+(\d{3,4})([EW])\s+(\d+)',
-                    re.MULTILINE,
-                )
-                t_lines = T_RE.findall(pt)
-                if not t_lines:
-                    continue  # not a position-bearing product
+                # JTWC GENTEXT advisory format (current as of 2025+):
+                #   WMO heading:     "WTPN31 PGTW 250900"  (DDHHMM, no Z)
+                #   Current pos:     "250600Z --- NEAR 24.8N 126.0E"
+                #                    under the "WARNING POSITION:" label
+                #   Forecast blocks: "12 HRS, VALID AT:\n251800Z --- 26.7N 127.2E"
+                #
+                # Stale files (past storms) stay on tgftp indefinitely.
+                # Two guards keep only fresh, active bulletins:
+                #   1. Skip FINAL advisories (storm has dissipated).
+                #   2. Skip bulletins whose WMO heading day ≠ today or yesterday UTC.
 
-                # T000 = current position and wind
-                hrs0, lat_raw, lat_h, lon_raw, lon_h, wind_raw = t_lines[0]
-                if int(hrs0) != 0:
+                if re.search(r'FINAL\s+(?:WARNING|ADVISORY)', pt, re.IGNORECASE):
                     continue
-                lat = float(lat_raw) / 10.0 * (1 if lat_h == 'N' else -1)
-                lon = float(lon_raw) / 10.0 * (1 if lon_h == 'E' else -1)
-                wind_kt = int(wind_raw)
 
-                # Cross-check with text: "MAX SUSTAINED WINDS - 110 KT"
+                hdr_m = re.search(r'^WT[A-Z]{2}\d+\s+[A-Z]+\s+(\d{2})\d{4}', pt, re.MULTILINE)
+                if hdr_m:
+                    bulletin_day = int(hdr_m.group(1))
+                    now_utc = datetime.utcnow()
+                    if bulletin_day not in {now_utc.day, (now_utc - timedelta(days=1)).day}:
+                        continue
+
+                # Parse current position: "250600Z --- NEAR 24.8N 126.0E"
+                wp_m = re.search(
+                    r'WARNING\s+POSITION:\s*\n\s*\d{6}Z\s+---\s+(?:NEAR\s+)?(\d+\.?\d*)\s*([NS])\s+(\d+\.?\d*)\s*([EW])',
+                    pt,
+                )
+                if not wp_m:
+                    continue
+                lat_s, lat_h, lon_s, lon_h = wp_m.groups()
+                lat = float(lat_s) * (1 if lat_h == 'N' else -1)
+                lon = float(lon_s) * (1 if lon_h == 'E' else -1)
+
+                # Wind: "MAX SUSTAINED WINDS - 050 KT"
                 wm = re.search(r'MAX\s+SUSTAINED\s+WINDS\s*-\s*(\d+)\s+KT', pt, re.IGNORECASE)
-                if wm:
-                    wind_kt = int(wm.group(1))
+                wind_kt = int(wm.group(1)) if wm else 0
 
-                # Pressure: "MINIMUM CENTRAL PRESSURE AT 230600Z IS 946 MB"
+                # Pressure: "MINIMUM CENTRAL PRESSURE AT 230600Z IS 986 MB"
                 pm = re.search(
                     r'CENTRAL\s+PRESSURE\s+AT\s+\d+Z\s+IS\s+(\d{3,4})\s+MB', pt, re.IGNORECASE,
                 )
@@ -914,25 +922,27 @@ def load_hurricane_data() -> tuple:
                     continue
                 seen_storm_ids.add(storm_num)
 
-                # Storm name: "TYPHOON 07W (MEKKHALA)"
+                # Storm name: "TROPICAL STORM 07W (MEKKHALA)"
                 nm = re.search(
                     r'(?:TYPHOON|TROPICAL\s+STORM|CYCLONE|DEPRESSION)\s+\d+[A-Z]\s+\(([A-Z]{2,})\)',
                     pt, re.IGNORECASE,
                 )
                 name = nm.group(1).capitalize() if nm else storm_num
 
-                # Forecast track from T-series lines (skip T000)
-                forecast_track = []
-                for hrs_s, la_r, la_h, lo_r, lo_h, wi_r in t_lines[1:]:
-                    hrs_i = int(hrs_s)
-                    if hrs_i == 0:
-                        continue
-                    forecast_track.append({
-                        'hours':   hrs_i,
-                        'lat':     float(la_r) / 10.0 * (1 if la_h == 'N' else -1),
-                        'lon':     float(lo_r) / 10.0 * (1 if lo_h == 'E' else -1),
-                        'wind_kt': int(wi_r),
-                    })
+                # Forecast track from "X HRS, VALID AT:" blocks
+                FCST_RE = re.compile(
+                    r'(\d+)\s+HRS?,\s+VALID\s+AT:[^\n]*\n\s*\d{6}Z\s+---\s+(?:NEAR\s+)?(\d+\.?\d*)\s*([NS])\s+(\d+\.?\d*)\s*([EW])',
+                    re.MULTILINE,
+                )
+                forecast_track = [
+                    {
+                        'hours':   int(h),
+                        'lat':     float(la) * (1 if lah == 'N' else -1),
+                        'lon':     float(lo) * (1 if loh == 'E' else -1),
+                        'wind_kt': wind_kt,
+                    }
+                    for h, la, lah, lo, loh in FCST_RE.findall(pt)
+                ]
 
                 classification = 'TY' if wind_kt >= 64 else ('TS' if wind_kt >= 34 else 'TD')
                 storms.append({
@@ -974,21 +984,24 @@ def load_hurricane_data() -> tuple:
                 df['ISO_TIME'] = _pd.to_datetime(df['ISO_TIME'], errors='coerce')
                 df = df.dropna(subset=['ISO_TIME', 'LAT', 'LON'])
 
-                # Get the most recent synoptic record per storm
+                # TRACK_TYPE is the definitive active-storm indicator in IBTrACS:
+                #   'provisional' = currently tracked, real-time unfinalized data
+                #   'main'        = finalized historical record
+                # The ACTIVE file can briefly retain recently-dissipated 'main' tracks,
+                # which is why date comparisons alone keep returning historical storms.
+                if 'TRACK_TYPE' in df.columns:
+                    prov = df[df['TRACK_TYPE'].str.strip().str.lower() == 'provisional']
+                    if not prov.empty:
+                        df = prov
+
+                # Most recent record per storm (after TRACK_TYPE filter)
                 latest = df.sort_values('ISO_TIME').groupby('SID').last().reset_index()
 
-                # Date-based currency filter.
-                # Compare Python date objects to avoid tz-aware vs tz-naive issues.
-                # IBTrACS synoptic times are UTC; Timestamp.utcnow().date() is also UTC.
-                # A storm is "current" if its last fix is from today; if IBTrACS hasn't
-                # updated yet today (rare outage), accept yesterday as a fallback.
-                today_date = _pd.Timestamp.utcnow().date()
-                yesterday_date = today_date - _pd.Timedelta(days=1)
-                latest_today = latest[latest['ISO_TIME'].dt.date >= today_date]
-                if not latest_today.empty:
-                    latest = latest_today
-                else:
-                    latest = latest[latest['ISO_TIME'].dt.date >= yesterday_date]
+                # Secondary guard: drop anything last seen more than 48 h ago.
+                # ISO_TIME is tz-naive; cutoff_ts built from naive utcnow() matches it.
+                import datetime as _dt_m
+                cutoff_ts = _pd.Timestamp(_dt_m.datetime.utcnow() - _dt_m.timedelta(hours=48))
+                latest = latest[latest['ISO_TIME'] >= cutoff_ts]
 
                 if latest.empty:
                     sources['ibtracs'] = 'ok (no current storms)'
