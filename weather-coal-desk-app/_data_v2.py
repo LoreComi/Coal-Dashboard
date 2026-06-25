@@ -974,8 +974,12 @@ def load_hurricane_data() -> tuple:
                 df['ISO_TIME'] = _pd.to_datetime(df['ISO_TIME'], errors='coerce')
                 df = df.dropna(subset=['ISO_TIME', 'LAT', 'LON'])
 
-                # Staleness filter: only storms with a record within the last 48 hours
-                cutoff = _pd.Timestamp.utcnow().tz_localize(None) - _pd.Timedelta(hours=48)
+                # Adaptive staleness filter:
+                #   JTWC found storms → 6h cutoff (IBTrACS just fills gaps; tight
+                #   window avoids picking up dissipated systems JTWC has dropped)
+                #   JTWC found nothing → 48h fallback (broader safety net)
+                ibt_hours = 6 if jtwc_storms_added > 0 else 48
+                cutoff = _pd.Timestamp.utcnow().tz_localize(None) - _pd.Timedelta(hours=ibt_hours)
                 df = df[df['ISO_TIME'] >= cutoff]
                 if df.empty:
                     sources['ibtracs'] = 'ok (no recent storms)'
