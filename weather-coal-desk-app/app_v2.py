@@ -822,8 +822,8 @@ _BRIEF_CSS = """
 """
 
 
-def _compute_cdd_summary() -> dict:
-    """Compute last-14-day CDD total vs 2000-2024 normal for each DEFAULT region.
+def _compute_cdd_summary(regions: list) -> dict:
+    """Compute last-14-day CDD total vs 2000-2024 normal for the given regions.
 
     Uses load_current_year_cdd() for actual recent data (ERA5 + ECMWF forecast),
     and the precomputed historical table for the normal baseline.
@@ -840,7 +840,7 @@ def _compute_cdd_summary() -> dict:
     except Exception:
         precomp_hist = pd.DataFrame()
 
-    for region in DEFAULT_REGIONS:
+    for region in regions:
         try:
             # ── Recent CDD: ERA5 actuals + ECMWF forecast gap-fill ───────────────
             current_df = load_current_year_cdd(region)
@@ -929,8 +929,8 @@ def _get_az_credentials() -> tuple[str, str, str] | tuple[None, None, None]:
 def render_coal_brief():
     st.markdown("#### AI COAL MARKET BRIEF")
     st.caption(
-        "5-agent AI analysis: storm supply risk · Rhine/Kaub transport · "
-        "European CDD · China Three Gorges hydro → coal market outlook"
+        "6-agent AI analysis: storm supply risk · Rhine/Kaub transport · "
+        "European CDD · Asia-Pacific CDD · China Three Gorges hydro → coal market outlook"
     )
     st.markdown(_BRIEF_CSS, unsafe_allow_html=True)
 
@@ -951,8 +951,8 @@ def render_coal_brief():
 
     if not generate and not cached:
         st.info(
-            "Click **Generate** to run the 5-agent AI analysis. "
-            "Each run makes 5 Azure OpenAI calls (~15-25 seconds)."
+            "Click **Generate** to run the 6-agent AI analysis. "
+            "Each run makes 6 Azure OpenAI calls (~20-30 seconds)."
         )
         with st.expander("What each agent uses"):
             st.markdown("""
@@ -960,13 +960,15 @@ def render_coal_brief():
 |---|---|
 | Hurricane | NHC + JTWC live storm data (already loaded by this app) |
 | Kaub | Live Rhine gauge from Pegelonline (German Federal Waterways) |
-| CDD | Databricks CDD anomalies per European region |
+| European CDD | Germany, France — Databricks ERA5 + ECMWF forecast |
+| Asia-Pacific CDD | China N/C/S, Japan, South Korea, India — Databricks ERA5 + ECMWF forecast |
 | China hydro | Three Gorges catchment precipitation from Databricks ERA5/ECMWF |
-| Synthesis | Combines all four findings into 4-6 coal trader bullets |
+| Synthesis | Combines all five findings into 5-6 coal trader bullets |
 """)
         return
 
     if generate:
+        from _ai_coal_brief import EU_REGIONS, ASIA_REGIONS
         progress = st.empty()
 
         def _prog(msg: str):
@@ -978,9 +980,16 @@ def render_coal_brief():
             storms, _ = storms_result if isinstance(storms_result, tuple) else (storms_result, {})
 
             _prog("Computing European CDD anomalies…")
-            cdd_summary = {}
+            cdd_eu = {}
             try:
-                cdd_summary = _compute_cdd_summary()
+                cdd_eu = _compute_cdd_summary(EU_REGIONS)
+            except Exception:
+                pass
+
+            _prog("Computing Asia-Pacific CDD anomalies…")
+            cdd_asia = {}
+            try:
+                cdd_asia = _compute_cdd_summary(ASIA_REGIONS)
             except Exception:
                 pass
 
@@ -998,7 +1007,8 @@ def render_coal_brief():
                 three_gorges_hist=tg_hist,
                 three_gorges_fcst=tg_fcst,
                 three_gorges_clim=tg_clim,
-                cdd_summary=cdd_summary,
+                cdd_eu=cdd_eu,
+                cdd_asia=cdd_asia,
                 azure_tenant_id=tenant_id,
                 azure_client_id=client_id,
                 azure_client_secret=client_secret,
@@ -1038,14 +1048,16 @@ def render_coal_brief():
         with st.expander("Hurricane / storm supply risk"):
             st.markdown(cached["hurricane"])
         with st.expander("European CDD / gas-coal switching"):
-            st.markdown(cached["cdd"])
+            st.markdown(cached.get("cdd_eu", ""))
+        with st.expander("China Three Gorges hydro"):
+            st.markdown(cached["china_hydro"])
     with c2:
         kaub_exp = (f"Rhine / Kaub — {cached['kaub_level_cm']:.0f} cm"
                     if cached.get("kaub_level_cm") else "Rhine / Kaub")
         with st.expander(kaub_exp):
             st.markdown(cached["kaub"])
-        with st.expander("China Three Gorges hydro"):
-            st.markdown(cached["china_hydro"])
+        with st.expander("Asia-Pacific CDD / coal power demand"):
+            st.markdown(cached.get("cdd_asia", ""))
 
 
 # ─── Tab: Kaub Levels ────────────────────────────────────────────────────────────

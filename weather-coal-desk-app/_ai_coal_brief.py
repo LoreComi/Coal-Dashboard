@@ -1,19 +1,20 @@
 """
-Coal market AI brief — 5-agent architecture.
+Coal market AI brief — 6-agent architecture.
 
 Flow
 ----
   Python data collectors build compact, structured context documents.
-  Four independent specialist LLM calls each analyse one domain.
-  One synthesis LLM call reads all four findings and writes 4-6 trader bullets.
+  Five independent specialist LLM calls each analyse one domain.
+  One synthesis LLM call reads all five findings and writes 4-6 trader bullets.
 
 Agents
 ------
-  1. hurricane   — storm threats to coal supply chains
-  2. kaub        — Rhine water level and European coal barge transport
-  3. cdd         — European CDD anomalies and gas-coal switching
-  4. china_hydro — Three Gorges catchment hydro and China coal demand
-  5. synthesis   — combines all four findings into a coal market brief
+  1. hurricane    — storm threats to coal supply chains
+  2. kaub         — Rhine water level and European coal barge transport
+  3. cdd_eu       — European CDD anomalies and gas-coal switching
+  4. cdd_asia     — Asia-Pacific CDD and direct coal power demand
+  5. china_hydro  — Three Gorges catchment hydro and China coal demand
+  6. synthesis    — combines all five findings into a coal market brief
 """
 from __future__ import annotations
 
@@ -21,6 +22,12 @@ import re
 from datetime import datetime, timedelta
 
 import pandas as pd
+
+
+# ── Region lists (match _config.REGION_MAP keys) ─────────────────────────────
+
+EU_REGIONS   = ['Germany', 'France']
+ASIA_REGIONS = ['China North', 'China Central', 'China South', 'Japan', 'South Korea', 'India']
 
 
 # ── Kaub navigation thresholds (cm above chart datum) ────────────────────────
@@ -86,21 +93,38 @@ Write 1-2 bullet points covering:
 Format: each bullet starts with "- ". Quote the specific level and the threshold context.
 """
 
-_SYS_CDD = """\
+_SYS_CDD_EU = """\
 You are a European power and gas analyst. CDD = max(T_mean − 18°C, 0).
 High CDD = above-normal heat = more air-conditioning = more electricity demand.
-In summer: high CDD → power demand up → gas turbines run more → TTF bid up.
-High TTF relative to coal → coal more competitive → coal burn increases.
+In summer: high CDD → more gas-for-power → TTF bid up → coal-gas switching point rises.
+In winter: cold anomaly → more heating demand → more gas burn → bullish TTF and coal.
 
-Regions that matter most:
-  Germany, France, Iberia (Spain/Portugal), NW Europe (Benelux, UK), Italy.
+Regions: Germany, France. Context: Benelux, UK, Iberia, Italy (not always in data).
 
 Write 1-2 bullet points on:
-  - The dominant regional temperature / CDD signal this week and next 2 weeks
-  - Whether it pushes gas-for-power demand up or down relative to normal
-  - The coal switching implication: is coal gaining or losing ground vs gas?
+  - Dominant temperature / CDD signal this week and next 1-2 weeks
+  - Whether it drives TTF / gas demand higher or lower
+  - Coal switching implication: is coal gaining or losing to gas?
 
-Format: each bullet starts with "- ". Name specific countries and magnitudes.
+Format: each bullet starts with "- ". Quote specific countries and CDD magnitudes.
+"""
+
+_SYS_CDD_ASIA = """\
+You are an Asia-Pacific power and coal demand analyst.
+CDD = max(T_mean − 18°C, 0). In Asia, cooling demand is met primarily by coal-fired power.
+China, Japan, and South Korea together import ~400 Mt/year of thermal coal.
+
+High CDD in China (esp. North, Central) → air-conditioning load up → coal power up
+  → bearish thermal coal stocks → bullish Newcastle, Indonesian HBA imports.
+High CDD in Japan/South Korea → similar dynamic (LNG + coal-fired power).
+High CDD in India → more coal-fired power → bullish Indian imports (Indonesian HBA).
+
+Write 1-2 bullet points on:
+  - The dominant temperature / CDD signal across China, Japan, South Korea, India
+  - Direct coal demand implication (power burn), NOT gas switching (Asia burns coal directly)
+  - Bullish or bearish for Newcastle index and Indonesian HBA
+
+Format: each bullet starts with "- ". Separate China from Japan/Korea/India where signals differ.
 """
 
 _SYS_CHINA_HYDRO = """\
@@ -131,21 +155,22 @@ Format: each bullet starts with "- ".
 
 _SYS_SYNTHESIS = """\
 You are the head coal trader at a major European energy company writing the daily brief.
-You have received analyses from four specialist agents:
+You have received analyses from five specialist agents:
   1. Hurricane/storm risk to coal supply chains
   2. Rhine/Kaub water levels and European inland coal transport
   3. European CDD anomalies and gas-coal switching
-  4. China Three Gorges hydro and China coal demand
+  4. Asia-Pacific CDD and direct coal power demand
+  5. China Three Gorges hydro and China coal demand
 
-Write exactly 4-6 bullet points for the morning coal market brief.
+Write exactly 5-6 bullet points for the morning coal market brief.
 
 Requirements:
   - LEAD with the single most market-moving signal right now.
-  - Each bullet must explicitly state bullish or bearish for a named benchmark:
-    API#2 ARA, API#4 Richards Bay, Newcastle index, or Indonesian HBA.
+  - Cover BOTH the European supply/transport angle (API#2 ARA) and the
+    Asian demand angle (Newcastle, Indonesian HBA) — at least one bullet each.
   - One bullet must describe a cross-market interaction where two or more signals
-    reinforce or offset each other (e.g., "cold NWE + low Rhine = doubly bullish API#2").
-  - One stability bullet: what is the primary uncertainty or what would flip this view?
+    reinforce or offset each other (e.g., "Asia CDD surge + low Rhine = bullish API#2 + Newcastle").
+  - One stability bullet: primary uncertainty or what would flip this view.
   - No intro sentence. No headers. No conclusion. No numbering.
   - Bullets only, each starting with "- ".
 """
@@ -220,18 +245,19 @@ def _fmt_kaub(measurements: list, current_cm: float | None) -> str:
     return "\n".join(lines)
 
 
-def _fmt_cdd(cdd_summary: dict) -> str:
+def _fmt_cdd(cdd_summary: dict, label: str = "") -> str:
     """cdd_summary: {region: {"anomaly": float, "current_7d": float}}"""
     ts = datetime.utcnow().strftime("%d %b %Y")
+    header = f"{'(' + label + ') ' if label else ''}CDD anomalies — last 14 days vs 2000-2024 normal — {ts}"
+
     if not cdd_summary:
         month = datetime.utcnow().month
         ctx = ("CDD season active (Jun–Sep)" if month in (6, 7, 8, 9) else
                "Shoulder season — CDD near zero" if month in (4, 5, 10, 11) else
                "Winter — heating season, CDD minimal")
-        return f"European CDD data — {ts}\nNo detailed CDD data available. Seasonal context: {ctx}"
+        return f"{header}\nNo detailed CDD data available. Seasonal context: {ctx}"
 
-    lines = [f"European CDD anomalies (last 14 days vs normal) — {ts}",
-             f"{'Region':<22} {'7-day CDD':>10} {'Anomaly':>10}  Direction"]
+    lines = [header, f"{'Region':<22} {'14d CDD':>10} {'Anomaly':>10}  Direction"]
     for region, d in sorted(cdd_summary.items()):
         anom = d.get("anomaly", 0.0)
         curr = d.get("current_7d", 0.0)
@@ -382,14 +408,15 @@ def generate_coal_brief(
     three_gorges_hist: pd.DataFrame,
     three_gorges_fcst: pd.DataFrame,
     three_gorges_clim: pd.DataFrame,
-    cdd_summary: dict,
+    cdd_eu: dict,
+    cdd_asia: dict,
     azure_tenant_id: str,
     azure_client_id: str,
     azure_client_secret: str,
     model: str = "gpt-4o",
     progress_cb=None,
 ) -> dict:
-    """Run the 5-agent coal brief pipeline.
+    """Run the 6-agent coal brief pipeline.
 
     Parameters
     ----------
@@ -397,14 +424,16 @@ def generate_coal_brief(
     three_gorges_hist    hist_df from load_watershed_precip("Three Gorges")
     three_gorges_fcst    fcst_df from load_watershed_precip("Three Gorges")
     three_gorges_clim    clim_df from load_watershed_precip("Three Gorges")
-    cdd_summary          {region: {"anomaly": float, "current_7d": float}}
+    cdd_eu               {region: {"anomaly": float, "current_7d": float}} for European regions
+    cdd_asia             {region: {"anomaly": float, "current_7d": float}} for Asian regions
     azure_*              service-principal credentials for Azure OpenAI
     model                Azure OpenAI deployment name (default "gpt-4o")
     progress_cb          optional callable(str) for Streamlit progress messages
 
     Returns
     -------
-    dict — hurricane, kaub, cdd, china_hydro, synthesis, kaub_level_cm, generated_at
+    dict — hurricane, kaub, cdd_eu, cdd_asia, china_hydro, synthesis,
+           kaub_level_cm, generated_at
     """
     def _prog(msg: str):
         if progress_cb:
@@ -417,10 +446,11 @@ def generate_coal_brief(
     kaub_measurements, kaub_level = fetch_kaub_levels()
 
     # ── Step 2: format context documents ─────────────────────────────────────
-    doc_hurricane = _fmt_hurricanes(storms)
-    doc_kaub      = _fmt_kaub(kaub_measurements, kaub_level)
-    doc_cdd       = _fmt_cdd(cdd_summary)
-    doc_hydro     = _fmt_china_hydro(three_gorges_hist, three_gorges_fcst, three_gorges_clim)
+    doc_hurricane  = _fmt_hurricanes(storms)
+    doc_kaub       = _fmt_kaub(kaub_measurements, kaub_level)
+    doc_cdd_eu     = _fmt_cdd(cdd_eu,   "Europe")
+    doc_cdd_asia   = _fmt_cdd(cdd_asia, "Asia-Pacific")
+    doc_hydro      = _fmt_china_hydro(three_gorges_hist, three_gorges_fcst, three_gorges_clim)
 
     # ── Step 3: specialist agents (independent, sequential) ───────────────────
     _prog("Hurricane analyst…")
@@ -429,8 +459,11 @@ def generate_coal_brief(
     _prog("Kaub analyst…")
     brief_kaub = _llm(client, _SYS_KAUB, doc_kaub, model)
 
-    _prog("CDD analyst…")
-    brief_cdd = _llm(client, _SYS_CDD, doc_cdd, model)
+    _prog("European CDD analyst…")
+    brief_cdd_eu = _llm(client, _SYS_CDD_EU, doc_cdd_eu, model)
+
+    _prog("Asia-Pacific CDD analyst…")
+    brief_cdd_asia = _llm(client, _SYS_CDD_ASIA, doc_cdd_asia, model)
 
     _prog("China hydro analyst…")
     brief_hydro = _llm(client, _SYS_CHINA_HYDRO, doc_hydro, model)
@@ -438,17 +471,19 @@ def generate_coal_brief(
     # ── Step 4: synthesis ─────────────────────────────────────────────────────
     _prog("Synthesis agent — writing coal market brief…")
     synthesis_input = "\n\n".join([
-        "=== STORM / HURRICANE SUPPLY RISK ===",   brief_hurricane,
-        "=== RHINE / KAUB TRANSPORT LEVELS ===",   brief_kaub,
-        "=== EUROPEAN CDD / GAS-COAL SWITCHING ===", brief_cdd,
-        "=== CHINA THREE GORGES HYDRO ===",         brief_hydro,
+        "=== STORM / HURRICANE SUPPLY RISK ===",      brief_hurricane,
+        "=== RHINE / KAUB TRANSPORT LEVELS ===",      brief_kaub,
+        "=== EUROPEAN CDD / GAS-COAL SWITCHING ===",  brief_cdd_eu,
+        "=== ASIA-PACIFIC CDD / COAL POWER DEMAND ===", brief_cdd_asia,
+        "=== CHINA THREE GORGES HYDRO ===",            brief_hydro,
     ])
-    brief_synthesis = _llm(client, _SYS_SYNTHESIS, synthesis_input, model, max_tokens=600)
+    brief_synthesis = _llm(client, _SYS_SYNTHESIS, synthesis_input, model, max_tokens=700)
 
     return {
         "hurricane":     brief_hurricane,
         "kaub":          brief_kaub,
-        "cdd":           brief_cdd,
+        "cdd_eu":        brief_cdd_eu,
+        "cdd_asia":      brief_cdd_asia,
         "china_hydro":   brief_hydro,
         "synthesis":     brief_synthesis,
         "kaub_level_cm": kaub_level,
