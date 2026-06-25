@@ -201,7 +201,7 @@ def _fmt_hurricanes(storms: list) -> str:
             line += f", {pres} hPa"
         lines.append(line)
 
-        track = s.get("forecast", [])
+        track = s.get("forecast_track", [])
         for pt in track[:4]:
             h = pt.get("hours", 0)
             if h == 0:

@@ -848,11 +848,12 @@ def load_hurricane_data() -> tuple:
         dr = _req.get(TGFTP_WMO, headers=HEADERS, timeout=20)
         if dr.status_code == 200:
             filenames = FILE_RE.findall(dr.text)
-            # Filter to warning series (product number 30-39); skip formation alerts (20-29)
+            # Include warning series (30-39) AND formation/special products (20-29);
+            # any file without a T000 position line is silently skipped below.
             warning_files = []
             for fn in filenames:
                 num_m = re.search(r'wt[a-z]{2}(\d{2,3})\.', fn)
-                if num_m and 30 <= int(num_m.group(1)) <= 39:
+                if num_m and 20 <= int(num_m.group(1)) <= 59:
                     warning_files.append(fn)
 
             for filename in warning_files:
@@ -872,10 +873,12 @@ def load_hurricane_data() -> tuple:
                 # tgftp JTWC format uses a compact T-series header, e.g.:
                 #   T000 191N 1248E 110   (current: lat=19.1N lon=124.8E wind=110kt)
                 #   T012 200N 1245E 100   (forecast +12h)
-                # Lat/lon are in tenths of degrees (3-digit lat, 4-digit lon).
-                # A valid warning always has T000; cancel/empty products don't.
+                # Lat/lon are in tenths of degrees. Lat is 2-3 digits (storms at
+                # low latitudes like 5°N = raw 50 may lack a leading zero).
+                # Lon is 3-4 digits: Indian Ocean storms at lon < 100°E give 3-digit
+                # values (e.g. 85°E = 850). Using \d{2,3} / \d{3,4} handles both.
                 T_RE = re.compile(
-                    r'^T(\d{3})\s+(\d{3})([NS])\s+(\d{4})([EW])\s+(\d+)',
+                    r'^T(\d{3})\s+(\d{2,3})([NS])\s+(\d{3,4})([EW])\s+(\d+)',
                     re.MULTILINE,
                 )
                 t_lines = T_RE.findall(pt)
@@ -953,10 +956,12 @@ def load_hurricane_data() -> tuple:
     except Exception as e:
         sources['jtwc'] = str(e)
 
-    # ── IBTrACS ACTIVE: fallback for W.Pacific/IO/SH if tgftp returned nothing ──
-    # Also fixes WMO_WIND blank issue by falling back to USA_WIND, and filters
-    # stale records (only storms last seen within 48 hours).
-    if jtwc_storms_added == 0:
+    # ── IBTrACS ACTIVE: runs always; fills any gap that tgftp parsing missed ────
+    # Uses position-proximity dedup (2°) to avoid duplicating storms already
+    # detected by JTWC. Fixes: (a) tgftp regex failures for unusual positions,
+    # (b) "jtwc_storms_added > 0 but a different basin missed" edge case.
+    # Staleness filter: only storms last seen within 48 hours.
+    if True:
         try:
             import pandas as _pd
             IBTRACS_URL = (
@@ -1016,6 +1021,14 @@ def load_hurricane_data() -> tuple:
                         continue
 
                     if abs(lat) > 90 or abs(lon) > 180:
+                        continue
+
+                    # Skip if JTWC already provided this storm (position within 2°)
+                    already_have = any(
+                        abs(s['lat'] - lat) < 2.0 and abs(s['lon'] - lon) < 2.0
+                        for s in storms
+                    )
+                    if already_have:
                         continue
 
                     storms.append({
