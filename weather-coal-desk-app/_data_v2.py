@@ -431,6 +431,97 @@ def load_precomputed_forecasts(parameter: str = None, model: str = None) -> pd.D
 # ─── Current year CDD from production tables ─────────────────────────────────────
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def load_current_year_cdd_bulk(regions: tuple) -> pd.DataFrame:
+    """Load current-year ERA5 actuals + ENS forecast for multiple regions in two queries.
+
+    ERA5 actuals cover the whole season so far; ENS fills the 7-day gap and future dates.
+    Returns DataFrame with columns: date, cdd, region.
+    """
+    current_year = datetime.now().year
+    season_start = f"{current_year}-{SEASON_START_MONTH:02d}-{SEASON_START_DAY:02d}"
+    gap_start = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+
+    all_cities = [c for r in regions for c in REGION_MAP.get(r, [])]
+    if not all_cities:
+        return pd.DataFrame(columns=['date', 'cdd', 'region'])
+
+    coord_parts = [
+        f"(latitude = {CITY_LOCATIONS[c]['latitude']} AND longitude = {CITY_LOCATIONS[c]['longitude']})"
+        for c in all_cities
+    ]
+    coord_filter = " OR ".join(coord_parts)
+
+    era5_q = f"""
+    SELECT CAST(delivery_start AS DATE) as date, value as temperature,
+           latitude, longitude
+    FROM {TABLE_HIST}
+    WHERE model = '{MODEL_HIST}' AND curve_name = '{CURVE_HIST}'
+      AND delivery_start >= '{season_start}'
+      AND ({coord_filter})
+    ORDER BY delivery_start
+    """
+    ens_q = f"""
+    SELECT CAST(delivery_start AS DATE) as date, AVG(value) as temperature,
+           latitude, longitude
+    FROM {TABLE_FCST}
+    WHERE model = '{MODEL_FCST}' AND curve_name = '{CURVE_FCST}'
+      AND CAST(delivery_start AS DATE) >= '{gap_start}'
+      AND ({coord_filter})
+    GROUP BY CAST(delivery_start AS DATE), latitude, longitude
+    ORDER BY date
+    """
+
+    era5_df = run_query(era5_q)
+    ens_df = run_query(ens_q)
+
+    coord_to_city = {
+        (CITY_LOCATIONS[c]['latitude'], CITY_LOCATIONS[c]['longitude']): c
+        for c in all_cities
+    }
+
+    frames = []
+    for df in (era5_df, ens_df):
+        if not df.empty:
+            df['date'] = pd.to_datetime(df['date'])
+            df['temperature'] = df['temperature'].astype(float)
+            df['latitude'] = df['latitude'].astype(float)
+            df['longitude'] = df['longitude'].astype(float)
+            df['city'] = df.apply(lambda r: coord_to_city.get((r['latitude'], r['longitude']), '?'), axis=1)
+            df['region'] = df['city'].map(CITY_TO_REGION)
+            frames.append(df[df['city'] != '?'])
+
+    if not frames:
+        return pd.DataFrame(columns=['date', 'cdd', 'region'])
+
+    # ERA5 rows appear first; pandas stable sort keeps ERA5 priority on dedup
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.sort_values(['date', 'city']).drop_duplicates(subset=['date', 'city'], keep='first')
+
+    region_results = []
+    for r in regions:
+        cities = REGION_MAP.get(r, [])
+        if not cities:
+            continue
+        rd = combined[combined['region'] == r].copy()
+        if rd.empty:
+            continue
+        rd['cdd_city'] = (rd['temperature'] - BASE_TEMP).clip(lower=0)
+        pivot = rd.pivot_table(index='date', columns='city', values='cdd_city', aggfunc='mean')
+        avail = [c for c in cities if c in pivot.columns]
+        if not avail:
+            continue
+        w = np.array([POPULATION[c] for c in avail], dtype=float)
+        w = w / w.sum()
+        weighted = (pivot[avail].values * w[None, :]).sum(axis=1)
+        region_results.append(pd.DataFrame({'date': pivot.index, 'cdd': weighted, 'region': r}))
+
+    if not region_results:
+        return pd.DataFrame(columns=['date', 'cdd', 'region'])
+
+    return pd.concat(region_results, ignore_index=True).sort_values(['region', 'date']).reset_index(drop=True)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_current_year_cdd(region: str) -> pd.DataFrame:
     """Load current year CDD from ERA5 actuals + ECMWF-ENS forecast gap fill."""
     current_year = datetime.now().year

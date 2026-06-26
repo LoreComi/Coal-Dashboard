@@ -25,7 +25,7 @@ from _data_v2 import (
     load_all_historical_cumulative, compute_similar_years,
     load_watershed_precip, load_gatun_lake_levels, load_hurricane_data,
     THREE_GORGES_DAM,
-    load_forecast_spread_bulk, compute_ensemble_spread,
+    load_current_year_cdd_bulk, load_forecast_spread_bulk, compute_ensemble_spread,
 )
 from _charts import (
     make_cumulative_cdd_chart, make_temperature_chart,
@@ -64,19 +64,19 @@ def render_cdd_dashboard():
         return
 
     current_year = datetime.now().year
-    today = pd.Timestamp.today().normalize()
     summary_rows = []
 
-    # ── Load all precomputed data ONCE for all regions (2 queries total) ──────
+    # ── Historical CDD (2000-2024): one query for all regions ─────────────────
     try:
         precomp_hist = load_precomputed_historical()
     except Exception:
         precomp_hist = pd.DataFrame()
 
+    # ── Current year: ERA5 actuals + ENS forecast, all regions in two queries ─
     try:
-        precomp_cdd = load_precomputed_cdd()
+        current_year_bulk = load_current_year_cdd_bulk(tuple(sorted(selected)))
     except Exception:
-        precomp_cdd = pd.DataFrame()
+        current_year_bulk = pd.DataFrame(columns=['date', 'cdd', 'region'])
 
     # ── Ensemble spread: one bulk query for all selected regions ──────────────
     try:
@@ -87,21 +87,16 @@ def render_cdd_dashboard():
     cols = st.columns(2)
     for idx, region in enumerate(selected):
         try:
-            # Historical CDD (2000-2024) for normal / previous year / similar years
+            # Historical CDD (2000-2024) for normal / prev year / similar years
             if not precomp_hist.empty and region in precomp_hist['region'].values:
                 region_cdd = precomp_hist[precomp_hist['region'] == region][['date', 'cdd']].sort_values('date').reset_index(drop=True)
             else:
                 hist_df = load_historical(region)
                 region_cdd = compute_region_cdd(hist_df, region) if not hist_df.empty else pd.DataFrame(columns=['date', 'cdd'])
 
-            # Current year: from precomputed table (ERA5 actuals + ENS forecast)
-            # Era5 rows take priority over ENS for the same date so actuals are preferred.
-            if not precomp_cdd.empty and region in precomp_cdd['region'].values:
-                rp = precomp_cdd[precomp_cdd['region'] == region].copy()
-                rp['_sort'] = rp['model'].apply(lambda m: 0 if 'era5' in str(m).lower() else 1)
-                combined = (rp.sort_values(['date', '_sort'])
-                              .drop_duplicates('date', keep='first')[['date', 'cdd']]
-                              .sort_values('date').reset_index(drop=True))
+            # Current year: use bulk result (ERA5 actuals + ENS gap-fill), fallback per-region
+            if not current_year_bulk.empty and region in current_year_bulk['region'].values:
+                combined = current_year_bulk[current_year_bulk['region'] == region][['date', 'cdd']].sort_values('date').reset_index(drop=True)
             else:
                 combined = load_current_year_cdd(region)
 
