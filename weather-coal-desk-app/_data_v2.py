@@ -607,9 +607,9 @@ def compute_region_cdd(df: pd.DataFrame, region: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_forecast_spread_bulk(regions: tuple) -> pd.DataFrame:
-    """Load ensemble temperature min/max for all cities in the given regions (one query).
+    """Load ensemble temperature 25th/75th percentile for all cities in the given regions (one query).
 
-    Returns a DataFrame with columns: date, temp_min, temp_max, city, region.
+    Returns a DataFrame with columns: date, temp_p25, temp_p75, city, region.
     Used to build the ensemble uncertainty band on the cumulative CDD chart.
     """
     all_cities = [c for r in regions for c in REGION_MAP.get(r, [])]
@@ -624,7 +624,8 @@ def load_forecast_spread_bulk(regions: tuple) -> pd.DataFrame:
 
     query = f"""
     SELECT CAST(delivery_start AS DATE) as date,
-           MIN(value) as temp_min, MAX(value) as temp_max,
+           PERCENTILE(value, 0.25) as temp_p25,
+           PERCENTILE(value, 0.75) as temp_p75,
            latitude, longitude
     FROM {TABLE_FCST}
     WHERE model = '{MODEL_FCST}' AND curve_name = '{CURVE_FCST}'
@@ -638,7 +639,7 @@ def load_forecast_spread_bulk(regions: tuple) -> pd.DataFrame:
         return df
 
     df['date'] = pd.to_datetime(df['date'])
-    for col in ('temp_min', 'temp_max', 'latitude', 'longitude'):
+    for col in ('temp_p25', 'temp_p75', 'latitude', 'longitude'):
         df[col] = df[col].astype(float)
 
     coord_to_city = {
@@ -651,7 +652,7 @@ def load_forecast_spread_bulk(regions: tuple) -> pd.DataFrame:
 
 
 def compute_ensemble_spread(spread_bulk_df: pd.DataFrame, region: str, cum_current: pd.DataFrame) -> pd.DataFrame:
-    """Compute cumulative CDD lower/upper bounds from ensemble min/max.
+    """Compute cumulative CDD lower/upper bounds from ensemble 25th/75th percentile.
 
     Returns DataFrame with day_of_season, cumulative_lower, cumulative_upper.
     The envelope starts from the last actual (observed) cumulative value.
@@ -672,8 +673,8 @@ def compute_ensemble_spread(spread_bulk_df: pd.DataFrame, region: str, cum_curre
             continue
         w = np.array([POPULATION[c] for c in avail], dtype=float)
         w = w / w.sum()
-        cdd_min = (np.maximum(grp.loc[avail, 'temp_min'].values - BASE_TEMP, 0) * w).sum()
-        cdd_max = (np.maximum(grp.loc[avail, 'temp_max'].values - BASE_TEMP, 0) * w).sum()
+        cdd_min = (np.maximum(grp.loc[avail, 'temp_p25'].values - BASE_TEMP, 0) * w).sum()
+        cdd_max = (np.maximum(grp.loc[avail, 'temp_p75'].values - BASE_TEMP, 0) * w).sum()
         rows.append({'date': date, 'cdd_min': cdd_min, 'cdd_max': cdd_max})
 
     if not rows:

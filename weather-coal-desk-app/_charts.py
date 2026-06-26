@@ -130,7 +130,7 @@ def make_cumulative_cdd_chart(
             x=ensemble_spread['day_of_season'], y=ensemble_spread['cumulative_lower'],
             mode='lines', line=dict(width=0),
             fill='tonexty', fillcolor='rgba(220,38,38,0.12)',
-            name='ENS spread',
+            name='ENS 25–75th pct',
         ))
 
     fig.update_layout(
