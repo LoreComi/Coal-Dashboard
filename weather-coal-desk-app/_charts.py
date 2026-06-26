@@ -30,6 +30,7 @@ def make_cumulative_cdd_chart(
     current_year: int,
     all_historical_cumulative: dict = None,
     similar_years: list = None,
+    ensemble_spread: pd.DataFrame = None,
 ) -> go.Figure:
     """Build the cumulative CDD chart for one region.
 
@@ -119,9 +120,22 @@ def make_cumulative_cdd_chart(
                 name=f'{current_year} (Forecast)',
             ))
 
+    # ── Ensemble spread band (shaded uncertainty around forecast) ─────────────
+    if ensemble_spread is not None and not ensemble_spread.empty:
+        fig.add_trace(go.Scatter(
+            x=ensemble_spread['day_of_season'], y=ensemble_spread['cumulative_upper'],
+            mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip',
+        ))
+        fig.add_trace(go.Scatter(
+            x=ensemble_spread['day_of_season'], y=ensemble_spread['cumulative_lower'],
+            mode='lines', line=dict(width=0),
+            fill='tonexty', fillcolor='rgba(220,38,38,0.12)',
+            name='ENS spread',
+        ))
+
     fig.update_layout(
         title=dict(text=f"Cumulative CDD — {region}", font=dict(size=14, color='#0f172a')),
-        xaxis_title="Days since April 15",
+        xaxis=dict(title="Days since April 15", range=[0, 150]),
         yaxis_title="Cumulative CDD (°C·d)",
         height=400,
         legend=dict(

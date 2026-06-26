@@ -514,6 +514,102 @@ def compute_region_cdd(df: pd.DataFrame, region: str) -> pd.DataFrame:
     return df[['date', 'cdd']].copy()
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_forecast_spread_bulk(regions: tuple) -> pd.DataFrame:
+    """Load ensemble temperature min/max for all cities in the given regions (one query).
+
+    Returns a DataFrame with columns: date, temp_min, temp_max, city, region.
+    Used to build the ensemble uncertainty band on the cumulative CDD chart.
+    """
+    all_cities = [c for r in regions for c in REGION_MAP.get(r, [])]
+    if not all_cities:
+        return pd.DataFrame()
+
+    coord_parts = []
+    for city in all_cities:
+        loc = CITY_LOCATIONS[city]
+        coord_parts.append(f"(latitude = {loc['latitude']} AND longitude = {loc['longitude']})")
+    coord_filter = " OR ".join(coord_parts)
+
+    query = f"""
+    SELECT CAST(delivery_start AS DATE) as date,
+           MIN(value) as temp_min, MAX(value) as temp_max,
+           latitude, longitude
+    FROM {TABLE_FCST}
+    WHERE model = '{MODEL_FCST}' AND curve_name = '{CURVE_FCST}'
+      AND delivery_start >= CURRENT_DATE()
+      AND ({coord_filter})
+    GROUP BY CAST(delivery_start AS DATE), latitude, longitude
+    ORDER BY date
+    """
+    df = run_query(query)
+    if df.empty:
+        return df
+
+    df['date'] = pd.to_datetime(df['date'])
+    for col in ('temp_min', 'temp_max', 'latitude', 'longitude'):
+        df[col] = df[col].astype(float)
+
+    coord_to_city = {
+        (CITY_LOCATIONS[c]['latitude'], CITY_LOCATIONS[c]['longitude']): c
+        for c in all_cities
+    }
+    df['city'] = df.apply(lambda r: coord_to_city.get((r['latitude'], r['longitude']), '?'), axis=1)
+    df['region'] = df['city'].map(CITY_TO_REGION)
+    return df
+
+
+def compute_ensemble_spread(spread_bulk_df: pd.DataFrame, region: str, cum_current: pd.DataFrame) -> pd.DataFrame:
+    """Compute cumulative CDD lower/upper bounds from ensemble min/max.
+
+    Returns DataFrame with day_of_season, cumulative_lower, cumulative_upper.
+    The envelope starts from the last actual (observed) cumulative value.
+    """
+    if spread_bulk_df.empty or cum_current.empty:
+        return pd.DataFrame(columns=['day_of_season', 'cumulative_lower', 'cumulative_upper'])
+
+    cities = REGION_MAP.get(region, [])
+    region_spread = spread_bulk_df[spread_bulk_df['region'] == region].copy()
+    if region_spread.empty or not cities:
+        return pd.DataFrame(columns=['day_of_season', 'cumulative_lower', 'cumulative_upper'])
+
+    rows = []
+    for date, grp in region_spread.groupby('date'):
+        grp = grp.set_index('city')
+        avail = [c for c in cities if c in grp.index]
+        if not avail:
+            continue
+        w = np.array([POPULATION[c] for c in avail], dtype=float)
+        w = w / w.sum()
+        cdd_min = (np.maximum(grp.loc[avail, 'temp_min'].values - BASE_TEMP, 0) * w).sum()
+        cdd_max = (np.maximum(grp.loc[avail, 'temp_max'].values - BASE_TEMP, 0) * w).sum()
+        rows.append({'date': date, 'cdd_min': cdd_min, 'cdd_max': cdd_max})
+
+    if not rows:
+        return pd.DataFrame(columns=['day_of_season', 'cumulative_lower', 'cumulative_upper'])
+
+    spread_cdd = pd.DataFrame(rows).sort_values('date').reset_index(drop=True)
+
+    today = pd.Timestamp.today().normalize()
+    actual_part = cum_current[cum_current['date'] <= today]
+    if actual_part.empty:
+        return pd.DataFrame(columns=['day_of_season', 'cumulative_lower', 'cumulative_upper'])
+
+    baseline = float(actual_part['cumulative_cdd'].iloc[-1])
+    last_day = int(actual_part['day_of_season'].iloc[-1])
+    last_date = actual_part['date'].iloc[-1]
+
+    spread_future = spread_cdd[spread_cdd['date'] > last_date].copy().reset_index(drop=True)
+    if spread_future.empty:
+        return pd.DataFrame(columns=['day_of_season', 'cumulative_lower', 'cumulative_upper'])
+
+    spread_future['cumulative_lower'] = baseline + spread_future['cdd_min'].cumsum()
+    spread_future['cumulative_upper'] = baseline + spread_future['cdd_max'].cumsum()
+    spread_future['day_of_season'] = range(last_day + 1, last_day + 1 + len(spread_future))
+
+    return spread_future[['day_of_season', 'cumulative_lower', 'cumulative_upper']]
+
+
 def compute_cumulative(cdd_df: pd.DataFrame, year: int) -> pd.DataFrame:
     start = pd.Timestamp(year=year, month=SEASON_START_MONTH, day=SEASON_START_DAY)
     end = pd.Timestamp(year=year + 1, month=SEASON_START_MONTH, day=SEASON_START_DAY - 1)
@@ -885,20 +981,41 @@ def load_hurricane_data() -> tuple:
                     continue
 
                 hdr_m = re.search(r'^WT[A-Z]{2}\d+\s+[A-Z]+\s+(\d{2})\d{4}', pt, re.MULTILINE)
-                if hdr_m:
-                    bulletin_day = int(hdr_m.group(1))
-                    now_utc = datetime.utcnow()
-                    if bulletin_day not in {now_utc.day, (now_utc - timedelta(days=1)).day}:
-                        continue
+                if not hdr_m:
+                    continue  # can't verify bulletin age — skip conservatively
+                bulletin_day = int(hdr_m.group(1))
+                now_utc = datetime.utcnow()
+                if bulletin_day not in {now_utc.day, (now_utc - timedelta(days=1)).day}:
+                    continue
 
-                # Parse current position: "250600Z --- NEAR 24.8N 126.0E"
+                # Parse current position and its DTG:
+                # "250600Z --- NEAR 24.8N 126.0E"
+                # Capture DTG groups (day, hhmm) so we can age-check the advisory.
                 wp_m = re.search(
-                    r'WARNING\s+POSITION:\s*\n\s*\d{6}Z\s+---\s+(?:NEAR\s+)?(\d+\.?\d*)\s*([NS])\s+(\d+\.?\d*)\s*([EW])',
+                    r'WARNING\s+POSITION:\s*\n\s*(\d{2})(\d{4})Z\s+---\s+(?:NEAR\s+)?(\d+\.?\d*)\s*([NS])\s+(\d+\.?\d*)\s*([EW])',
                     pt,
                 )
                 if not wp_m:
                     continue
-                lat_s, lat_h, lon_s, lon_h = wp_m.groups()
+
+                # Age check: JTWC updates every 6 h; an active storm has a fix within
+                # the last 6 h. If the WARNING POSITION is > 18 h old the storm has
+                # missed at least 2 advisory cycles and is no longer being tracked.
+                pos_day_s, pos_hhmm, lat_s, lat_h, lon_s, lon_h = wp_m.groups()
+                try:
+                    pos_dt = now_utc.replace(day=int(pos_day_s),
+                                             hour=int(pos_hhmm[:2]),
+                                             minute=int(pos_hhmm[2:]),
+                                             second=0, microsecond=0)
+                    if pos_dt > now_utc + timedelta(hours=1):
+                        # day belongs to previous month
+                        m = now_utc.month - 1 or 12
+                        y = now_utc.year if now_utc.month > 1 else now_utc.year - 1
+                        pos_dt = pos_dt.replace(year=y, month=m)
+                    if (now_utc - pos_dt).total_seconds() > 18 * 3600:
+                        continue  # last fix too old — storm no longer active
+                except (ValueError, OverflowError):
+                    pass  # unparseable DTG; proceed
                 lat = float(lat_s) * (1 if lat_h == 'N' else -1)
                 lon = float(lon_s) * (1 if lon_h == 'E' else -1)
 
@@ -966,20 +1083,36 @@ def load_hurricane_data() -> tuple:
     except Exception as e:
         sources['jtwc'] = str(e)
 
-    # ── IBTrACS ACTIVE: runs always; fills any gap that tgftp parsing missed ────
-    # Uses position-proximity dedup (2°) to avoid duplicating storms already
-    # detected by JTWC. Fixes: (a) tgftp regex failures for unusual positions,
-    # (b) "jtwc_storms_added > 0 but a different basin missed" edge case.
-    # Staleness filter: only storms last seen within 48 hours.
+    # ── IBTrACS ACTIVE: fills gaps that tgftp parsing missed ────────────────────
+    # Uses position-proximity dedup (2°) to avoid duplicating JTWC storms.
+    # The ACTIVE file is only updated during active storm seasons; skip if
+    # Last-Modified shows it hasn't changed in > 24 h (quiet season).
     if True:
+        _ibtracs_ok = True
         try:
             import pandas as _pd
+            import email.utils as _eu
             IBTRACS_URL = (
                 "https://www.ncei.noaa.gov/data/international-best-track-archive-for-climate-"
                 "stewardship-ibtracs/v04r00/access/csv/ibtracs.ACTIVE.list.v04r00.csv"
             )
-            ir = _req.get(IBTRACS_URL, headers=HEADERS, timeout=30)
-            if ir.status_code == 200:
+            # HEAD first to check freshness without downloading the full file
+            hd = _req.head(IBTRACS_URL, headers=HEADERS, timeout=10)
+            lm = hd.headers.get('Last-Modified', '')
+            if lm:
+                lm_dt = _eu.parsedate_to_datetime(lm)
+                import datetime as _dt2
+                lm_utc = lm_dt.astimezone(_dt2.timezone.utc).replace(tzinfo=None)
+                age_h = (datetime.utcnow() - lm_utc).total_seconds() / 3600
+                if age_h > 24:
+                    sources['ibtracs'] = f'skipped ({int(age_h)}h stale)'
+                    _ibtracs_ok = False
+        except Exception:
+            _ibtracs_ok = True  # if HEAD fails, try the GET anyway
+        try:
+            if _ibtracs_ok:
+                ir = _req.get(IBTRACS_URL, headers=HEADERS, timeout=30)
+            if _ibtracs_ok and ir.status_code == 200:
                 df = _pd.read_csv(io.StringIO(ir.text), skiprows=[1], low_memory=False)
                 df['ISO_TIME'] = _pd.to_datetime(df['ISO_TIME'], errors='coerce')
                 df = df.dropna(subset=['ISO_TIME', 'LAT', 'LON'])
@@ -1068,7 +1201,7 @@ def load_hurricane_data() -> tuple:
                         'forecast_track': [],
                     })
                 sources['ibtracs'] = 'ok'
-            else:
+            elif _ibtracs_ok:
                 sources['ibtracs'] = f'HTTP {ir.status_code}'
         except Exception as e:
             sources['ibtracs'] = str(e)

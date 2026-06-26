@@ -25,6 +25,7 @@ from _data_v2 import (
     load_all_historical_cumulative, compute_similar_years,
     load_watershed_precip, load_gatun_lake_levels, load_hurricane_data,
     THREE_GORGES_DAM,
+    load_forecast_spread_bulk, compute_ensemble_spread,
 )
 from _charts import (
     make_cumulative_cdd_chart, make_temperature_chart,
@@ -63,38 +64,62 @@ def render_cdd_dashboard():
         return
 
     current_year = datetime.now().year
+    today = pd.Timestamp.today().normalize()
     summary_rows = []
 
+    # ── Load all precomputed data ONCE for all regions (2 queries total) ──────
     try:
         precomp_hist = load_precomputed_historical()
     except Exception:
         precomp_hist = pd.DataFrame()
 
+    try:
+        precomp_cdd = load_precomputed_cdd()
+    except Exception:
+        precomp_cdd = pd.DataFrame()
+
+    # ── Ensemble spread: one bulk query for all selected regions ──────────────
+    try:
+        spread_bulk = load_forecast_spread_bulk(tuple(sorted(selected)))
+    except Exception:
+        spread_bulk = pd.DataFrame()
+
     cols = st.columns(2)
     for idx, region in enumerate(selected):
         try:
-            # Historical CDD for normal/prev year (from precomputed table: 2000-2024)
-            if not precomp_hist.empty:
-                region_cdd = precomp_hist[precomp_hist['region'] == region][['date', 'cdd']].copy()
+            # Historical CDD (2000-2024) for normal / previous year / similar years
+            if not precomp_hist.empty and region in precomp_hist['region'].values:
+                region_cdd = precomp_hist[precomp_hist['region'] == region][['date', 'cdd']].sort_values('date').reset_index(drop=True)
             else:
                 hist_df = load_historical(region)
                 region_cdd = compute_region_cdd(hist_df, region) if not hist_df.empty else pd.DataFrame(columns=['date', 'cdd'])
 
-            # Current year: ERA5 actuals + forecast from production tables
-            combined = load_current_year_cdd(region)
+            # Current year: from precomputed table (ERA5 actuals + ENS forecast)
+            # Era5 rows take priority over ENS for the same date so actuals are preferred.
+            if not precomp_cdd.empty and region in precomp_cdd['region'].values:
+                rp = precomp_cdd[precomp_cdd['region'] == region].copy()
+                rp['_sort'] = rp['model'].apply(lambda m: 0 if 'era5' in str(m).lower() else 1)
+                combined = (rp.sort_values(['date', '_sort'])
+                              .drop_duplicates('date', keep='first')[['date', 'cdd']]
+                              .sort_values('date').reset_index(drop=True))
+            else:
+                combined = load_current_year_cdd(region)
 
             cum_current = compute_cumulative(combined, current_year)
             cum_prev = compute_cumulative(region_cdd, current_year - 1)
             normal = compute_normal(region_cdd)
 
-            # Similarity analysis — pre-compute all historical trajectories once
             all_hist_cum = load_all_historical_cumulative(region_cdd)
             sim_years = compute_similar_years(region_cdd, cum_current)
+
+            # Ensemble uncertainty band on the forecast portion
+            ensemble_spread = compute_ensemble_spread(spread_bulk, region, cum_current)
 
             fig = make_cumulative_cdd_chart(
                 region, cum_current, cum_prev, normal, current_year,
                 all_historical_cumulative=all_hist_cum,
                 similar_years=sim_years,
+                ensemble_spread=ensemble_spread,
             )
             with cols[idx % 2]:
                 st.plotly_chart(fig, use_container_width=True)
