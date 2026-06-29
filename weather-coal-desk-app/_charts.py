@@ -218,6 +218,95 @@ def make_daily_cdd_bars(city: str, city_data: pd.DataFrame) -> go.Figure:
     return _apply_theme(fig)
 
 
+# ─── CDD Forecast charts ─────────────────────────────────────────────────────────
+
+def make_forecast_temperature_chart(region: str, fcst_temp: pd.DataFrame, clim_temp: pd.DataFrame) -> go.Figure:
+    """Forecast temperature vs climatological normal with CDD base reference line."""
+    fig = go.Figure()
+
+    if not fcst_temp.empty:
+        fcst_with_doy = fcst_temp.copy()
+        fcst_with_doy['day_of_year'] = pd.to_datetime(fcst_with_doy['date']).dt.day_of_year
+
+        if not clim_temp.empty:
+            merged = fcst_with_doy.merge(clim_temp, on='day_of_year', how='left')
+            fig.add_trace(go.Scatter(
+                x=merged['date'], y=merged['mean_temp'] + merged['std_temp'],
+                mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip',
+            ))
+            fig.add_trace(go.Scatter(
+                x=merged['date'], y=(merged['mean_temp'] - merged['std_temp']).clip(lower=0),
+                mode='lines', line=dict(width=0),
+                fill='tonexty', fillcolor='rgba(107,114,128,0.15)',
+                name='Clim ±1σ',
+            ))
+            fig.add_trace(go.Scatter(
+                x=merged['date'], y=merged['mean_temp'],
+                mode='lines', line=dict(color='#9ca3af', dash='dash', width=1.5),
+                name='Clim mean',
+            ))
+
+        fig.add_trace(go.Scatter(
+            x=fcst_temp['date'], y=fcst_temp['temperature'],
+            mode='lines+markers', name='Forecast',
+            line=dict(color='#ea580c', width=2.5),
+            marker=dict(size=5),
+        ))
+
+    fig.add_hline(y=BASE_TEMP, line_dash='dot', line_color='#16a34a',
+                  annotation_text=f"CDD base ({BASE_TEMP}°C)",
+                  annotation_font_color='#16a34a')
+
+    fig.update_layout(
+        title=dict(text=f"Temperature Forecast — {region}", font=dict(size=14, color='#0f172a')),
+        xaxis_title="Date", yaxis_title="°C",
+        height=340,
+        legend=dict(x=1.01, y=1, xanchor='left', font=dict(size=10, color='#374151'),
+                    bgcolor='rgba(255,255,255,0.92)', bordercolor='#e2e8f0', borderwidth=1),
+    )
+    return _apply_theme(fig)
+
+
+def make_forecast_cdd_deviation_chart(region: str, fcst_cdd: pd.DataFrame, clim_cdd: pd.DataFrame) -> go.Figure:
+    """Overlay bar chart: forecast daily CDD vs historical normal, deviation colored warm/cool."""
+    fig = go.Figure()
+
+    if not fcst_cdd.empty:
+        fcst_cdd = fcst_cdd.copy()
+        fcst_cdd['day_of_year'] = pd.to_datetime(fcst_cdd['date']).dt.day_of_year
+
+        if not clim_cdd.empty:
+            merged = fcst_cdd.merge(clim_cdd, on='day_of_year', how='left')
+            merged['mean_cdd'] = merged['mean_cdd'].fillna(0)
+            merged['deviation'] = merged['cdd'] - merged['mean_cdd']
+
+            fig.add_trace(go.Bar(
+                x=merged['date'], y=merged['mean_cdd'],
+                name='Normal', marker_color='rgba(156,163,175,0.7)',
+                marker_line_width=0,
+            ))
+            bar_colors = ['#dc2626' if d >= 0 else '#2563eb' for d in merged['deviation']]
+            fig.add_trace(go.Bar(
+                x=merged['date'], y=merged['cdd'],
+                name='Forecast', marker_color=bar_colors,
+                marker_line_width=0, opacity=0.75,
+            ))
+        else:
+            fig.add_trace(go.Bar(
+                x=fcst_cdd['date'], y=fcst_cdd['cdd'],
+                name='Forecast CDD', marker_color='#ea580c', marker_line_width=0,
+            ))
+
+    fig.update_layout(
+        title=dict(text=f"Daily CDD vs Normal — {region}", font=dict(size=14, color='#0f172a')),
+        xaxis_title="Date", yaxis_title="CDD (°C·d)",
+        height=280, barmode='overlay',
+        legend=dict(x=1.01, y=1, xanchor='left', font=dict(size=10, color='#374151'),
+                    bgcolor='rgba(255,255,255,0.92)', bordercolor='#e2e8f0', borderwidth=1),
+    )
+    return _apply_theme(fig)
+
+
 # ─── Anomaly map ─────────────────────────────────────────────────────────────────
 
 def make_anomaly_map(anomalies: pd.DataFrame, target_date) -> go.Figure:

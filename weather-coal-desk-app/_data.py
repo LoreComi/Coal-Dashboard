@@ -391,3 +391,49 @@ def compute_similar_years(historical_cdd: pd.DataFrame, current_cum: pd.DataFram
         scores.append((year, score))
     scores.sort(key=lambda x: x[1])
     return scores[:n_similar]
+
+
+def compute_region_temperature(df: pd.DataFrame, region: str) -> pd.DataFrame:
+    """Population-weighted daily mean temperature for a region."""
+    if df.empty:
+        return pd.DataFrame(columns=['date', 'temperature'])
+    cities = REGION_MAP[region]
+    df = df.copy()
+    pivot = df.pivot_table(index='date', columns='city', values='temperature', aggfunc='mean')
+    available = [c for c in cities if c in pivot.columns]
+    if not available:
+        return pd.DataFrame(columns=['date', 'temperature'])
+    pops = np.array([POPULATION[c] for c in available], dtype=float)
+    weights = pops / pops.sum()
+    weighted = (pivot[available].values * weights[None, :]).sum(axis=1)
+    return pd.DataFrame({'date': pivot.index, 'temperature': weighted}).sort_values('date').reset_index(drop=True)
+
+
+def compute_daily_cdd_climatology(region_cdd_df: pd.DataFrame) -> pd.DataFrame:
+    """Day-of-year mean and std of daily CDD from historical data (2000–2024)."""
+    if region_cdd_df.empty:
+        return pd.DataFrame(columns=['day_of_year', 'mean_cdd', 'std_cdd'])
+    df = region_cdd_df.copy()
+    df['day_of_year'] = df['date'].dt.day_of_year
+    df['year'] = df['date'].dt.year
+    df = df[df['year'].between(HIST_START_YEAR, HIST_END_YEAR)]
+    stats = df.groupby('day_of_year')['cdd'].agg(['mean', 'std']).reset_index()
+    stats.columns = ['day_of_year', 'mean_cdd', 'std_cdd']
+    stats['std_cdd'] = stats['std_cdd'].fillna(0)
+    return stats
+
+
+def compute_temperature_climatology(region_hist_df: pd.DataFrame, region: str) -> pd.DataFrame:
+    """Day-of-year mean and std of region temperature from historical data (2000–2024)."""
+    if region_hist_df.empty:
+        return pd.DataFrame(columns=['day_of_year', 'mean_temp', 'std_temp'])
+    temp_df = compute_region_temperature(region_hist_df, region)
+    if temp_df.empty:
+        return pd.DataFrame(columns=['day_of_year', 'mean_temp', 'std_temp'])
+    temp_df['day_of_year'] = temp_df['date'].dt.day_of_year
+    temp_df['year'] = temp_df['date'].dt.year
+    temp_df = temp_df[temp_df['year'].between(HIST_START_YEAR, HIST_END_YEAR)]
+    stats = temp_df.groupby('day_of_year')['temperature'].agg(['mean', 'std']).reset_index()
+    stats.columns = ['day_of_year', 'mean_temp', 'std_temp']
+    stats['std_temp'] = stats['std_temp'].fillna(0)
+    return stats

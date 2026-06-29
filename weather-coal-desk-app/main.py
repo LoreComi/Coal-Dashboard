@@ -21,17 +21,17 @@ import pandas as pd
 import streamlit as st
 
 from _config import (
-    REGION_MAP, CITY_LOCATIONS, POPULATION, CITY_TO_REGION,
-    BASE_TEMP, DEFAULT_REGIONS,
+    REGION_MAP, DEFAULT_REGIONS,
 )
 from _data import (
-    load_historical, load_forecast, load_city_timeseries, load_anomalies,
+    load_historical, load_forecast, load_anomalies,
     compute_region_cdd, compute_cumulative, compute_normal,
     load_all_historical_cumulative, compute_similar_years,
+    compute_region_temperature, compute_daily_cdd_climatology, compute_temperature_climatology,
 )
 from _charts import (
-    make_cumulative_cdd_chart, make_temperature_chart,
-    make_daily_cdd_bars, make_anomaly_map,
+    make_cumulative_cdd_chart, make_anomaly_map,
+    make_forecast_temperature_chart, make_forecast_cdd_deviation_chart,
 )
 from _style import CUSTOM_CSS
 
@@ -180,51 +180,82 @@ def render_anomaly_map():
     st.dataframe(disp, use_container_width=True, hide_index=True)
 
 
-# ─── Tab 3: City Detail ──────────────────────────────────────────────────────────
+# ─── Tab 3: CDD Forecast ─────────────────────────────────────────────────────────
 
-def render_city_detail():
-    st.markdown("#### CITY DETAIL")
+def render_cdd_forecast():
+    st.markdown("#### CDD FORECAST")
+    st.caption("14-day ECMWF-ENS forecast vs climatology (2000–2024). CDD = max(T_mean − 18°C, 0).")
 
-    city = st.selectbox("City", sorted(CITY_LOCATIONS.keys()), label_visibility="collapsed")
-    if not city:
+    selected = st.multiselect(
+        "Regions", options=list(REGION_MAP.keys()), default=DEFAULT_REGIONS,
+        label_visibility="collapsed", key="fcst_regions",
+    )
+    if not selected:
+        st.info("Select at least one region.")
         return
 
-    loc = CITY_LOCATIONS[city]
-    region = CITY_TO_REGION.get(city, '?')
-    st.caption(f"Region: **{region}** | Lat {loc['latitude']}°, Lon {loc['longitude']}° | Pop: {POPULATION[city]:,}")
+    summary_rows = []
+    cols = st.columns(2)
 
-    try:
-        data = load_city_timeseries(city)
-    except Exception as e:
-        st.error(f"Error: {e}")
-        return
+    for idx, region in enumerate(selected):
+        try:
+            hist_df = load_historical(region)
+            fcst_df = load_forecast(region)
 
-    if data.empty:
-        st.warning(f"No data for {city}.")
-        return
+            if fcst_df.empty:
+                with cols[idx % 2]:
+                    st.warning(f"No forecast data for {region}.")
+                continue
 
-    # Temperature chart
-    fig_temp = make_temperature_chart(city, data)
-    st.plotly_chart(fig_temp, use_container_width=True)
+            # Temperature forecast vs climatology
+            fcst_temp = compute_region_temperature(fcst_df, region)
+            clim_temp = compute_temperature_climatology(hist_df, region) if not hist_df.empty else pd.DataFrame()
 
-    # Daily CDD bars
-    fig_cdd = make_daily_cdd_bars(city, data)
-    st.plotly_chart(fig_cdd, use_container_width=True)
+            # Daily CDD forecast vs normal
+            fcst_cdd = compute_region_cdd(fcst_df, region)
+            hist_cdd = compute_region_cdd(hist_df, region) if not hist_df.empty else pd.DataFrame(columns=['date', 'cdd'])
+            clim_cdd = compute_daily_cdd_climatology(hist_cdd) if not hist_cdd.empty else pd.DataFrame()
 
-    # Cumulative CDD
-    current_year = datetime.now().year
-    data_cdd = data.copy()
-    data_cdd['cdd'] = (data_cdd['temperature'] - BASE_TEMP).clip(lower=0)
-    cum = compute_cumulative(data_cdd, current_year)
+            fig_temp = make_forecast_temperature_chart(region, fcst_temp, clim_temp)
+            fig_dev = make_forecast_cdd_deviation_chart(region, fcst_cdd, clim_cdd)
 
-    # Simple single-city normal (from historical if available in timeseries)
-    if not cum.empty:
-        from _charts import make_cumulative_cdd_chart
-        # For city detail we just show current year curve (no historical norm)
-        fig_cum = make_cumulative_cdd_chart(
-            city, cum, pd.DataFrame(), pd.DataFrame(), current_year
-        )
-        st.plotly_chart(fig_cum, use_container_width=True)
+            with cols[idx % 2]:
+                st.plotly_chart(fig_temp, use_container_width=True)
+                st.plotly_chart(fig_dev, use_container_width=True)
+
+            # Summary stats for KPI cards
+            if not fcst_cdd.empty and not clim_cdd.empty:
+                fcst_cdd_copy = fcst_cdd.copy()
+                fcst_cdd_copy['day_of_year'] = pd.to_datetime(fcst_cdd_copy['date']).dt.day_of_year
+                merged = fcst_cdd_copy.merge(clim_cdd, on='day_of_year', how='left')
+                total_fcst = merged['cdd'].sum()
+                total_normal = merged['mean_cdd'].fillna(0).sum()
+                deviation = total_fcst - total_normal
+                summary_rows.append({
+                    'Region': region,
+                    'Fcst CDD': f"{total_fcst:.0f}",
+                    'Normal CDD': f"{total_normal:.0f}",
+                    'Deviation': f"{deviation:+.0f}",
+                    'Days': len(merged),
+                })
+        except Exception as e:
+            with cols[idx % 2]:
+                st.error(f"{region}: {e}")
+                with st.expander("Details"):
+                    st.text(traceback.format_exc())
+
+    # KPI summary
+    if summary_rows:
+        st.markdown("---")
+        st.markdown("#### FORECAST SUMMARY")
+        kpi_cols = st.columns(min(len(summary_rows), 6))
+        for i, row in enumerate(summary_rows[:6]):
+            dev = float(row['Deviation'])
+            cls = "kpi-card-warm" if dev > 0 else "kpi-card-cool"
+            with kpi_cols[i]:
+                st.markdown(kpi_card(row['Region'], dev, "°C·d vs normal", card_class=cls), unsafe_allow_html=True)
+
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -235,7 +266,7 @@ def main():
     tab1, tab2, tab3 = st.tabs([
         "CDD Dashboard",
         "Anomaly Map",
-        "City Detail",
+        "CDD Forecast",
     ])
 
     with tab1:
@@ -243,7 +274,7 @@ def main():
     with tab2:
         render_anomaly_map()
     with tab3:
-        render_city_detail()
+        render_cdd_forecast()
 
 
 if __name__ == "__main__":
