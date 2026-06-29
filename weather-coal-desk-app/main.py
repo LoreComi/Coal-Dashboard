@@ -64,6 +64,38 @@ def kpi_card(label: str, value, unit: str, delta=None, card_class: str = "") -> 
     """
 
 
+def kpi_card_dual(label: str, ens_dev, vareps_dev) -> str:
+    """KPI card with separate ENS (14d) and vareps (44d) deviation rows."""
+
+    def _row(name, dev, color):
+        if dev is None or (isinstance(dev, float) and np.isnan(dev)):
+            return f'<div class="kpi-delta">\u2014 {name}</div>'
+        arrow = "\u25b2" if dev > 0 else ("\u25bc" if dev < 0 else "\u25cf")
+        css = "kpi-delta-up" if dev > 0 else ("kpi-delta-down" if dev < 0 else "kpi-delta-flat")
+        return (
+            f'<div class="kpi-delta {css}" style="color:{color}">'
+            f'{arrow} {abs(dev):.1f}\u202f\u00b0C\u00b7d'
+            f'<span style="font-size:0.72em;font-weight:400;opacity:0.85;margin-left:4px">{name}</span>'
+            f'</div>'
+        )
+
+    card_cls = (
+        "kpi-card-warm"
+        if isinstance(ens_dev, float) and not np.isnan(ens_dev) and ens_dev > 0
+        else "kpi-card-cool"
+    )
+    ens_row = _row("ENS 14d", ens_dev, "#ea580c")
+    vareps_row = _row("vareps 44d", vareps_dev, "#7c3aed")
+    return f"""
+    <div class="kpi-card {card_cls}">
+        <div class="kpi-label">{label}</div>
+        <div style="font-size:0.72em;color:#6b7280;margin-bottom:2px">vs Normal</div>
+        {ens_row}
+        {vareps_row}
+    </div>
+    """
+
+
 # ─── Tab 1: CDD Dashboard ────────────────────────────────────────────────────────
 
 def render_cdd_dashboard():
@@ -92,7 +124,12 @@ def render_cdd_dashboard():
             region_cdd = compute_region_cdd(hist_df, region)
 
             fcst_df = load_forecast(region)
-            fcst_cdd = compute_region_cdd(fcst_df, region) if not fcst_df.empty else pd.DataFrame(columns=['date', 'cdd'])
+            # load_forecast now returns {date, model, cdd, temperature}; use ENS for the cumulative chart
+            if not fcst_df.empty:
+                ens_df = fcst_df[fcst_df['model'] == 'ecmwf-ens']
+                fcst_cdd = ens_df[['date', 'cdd']].copy() if not ens_df.empty else pd.DataFrame(columns=['date', 'cdd'])
+            else:
+                fcst_cdd = pd.DataFrame(columns=['date', 'cdd'])
 
             # Combine actual + forecast for current year
             current = region_cdd[region_cdd['date'] >= f'{current_year}-01-01'].copy()

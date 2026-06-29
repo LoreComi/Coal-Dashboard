@@ -145,28 +145,22 @@ def load_historical(region: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_forecast(region: str) -> pd.DataFrame:
-    """Load latest ECMWF-ENS t_mean forecast for a region."""
-    cities = REGION_MAP[region]
-    cf = _coord_filter(cities)
+    """Load ecmwf-ens (14d) and ecmwf-vareps (44d) from the pre-computed sandbox table.
+
+    Returns columns: date, model, cdd, temperature (region-level, population-weighted).
+    """
     query = f"""
-    SELECT CAST(delivery_start AS DATE) as date, value as temperature,
-           latitude, longitude
-    FROM {TABLE_FCST}
-    WHERE model = '{MODEL_FCST}'
-      AND curve_name = '{CURVE_FCST}'
-      AND delivery_start >= CURRENT_DATE()
-      AND ({cf})
-    ORDER BY delivery_start
+    SELECT date, model, cdd, temperature
+    FROM {COAL_DESK_SCHEMA}.coal_desk_cdd
+    WHERE region = '{region}'
+    ORDER BY model, date
     """
     df = run_query(query)
     if df.empty:
         return df
-    df['date'] = pd.to_datetime(df['date'])
+    df['date'] = pd.to_datetime(df['date'], utc=True).dt.tz_localize(None)
+    df['cdd'] = df['cdd'].astype(float)
     df['temperature'] = df['temperature'].astype(float)
-    df['latitude'] = df['latitude'].astype(float)
-    df['longitude'] = df['longitude'].astype(float)
-    lookup = _coord_to_city_map(cities)
-    df['city'] = df.apply(lambda r: lookup.get((r['latitude'], r['longitude']), '?'), axis=1)
     return df
 
 

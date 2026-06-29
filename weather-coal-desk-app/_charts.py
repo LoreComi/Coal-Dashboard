@@ -13,6 +13,10 @@ from _config import BASE_TEMP
 # Colors for the 5 most-similar historical years — saturated for white background
 _SIMILAR_COLORS = ['#1d4ed8', '#7c3aed', '#ea580c', '#0369a1', '#16a34a']
 
+# Per-model colours and legend labels for the CDD Forecast tab
+_MODEL_COLORS = {'ecmwf-ens': '#ea580c', 'ecmwf-vareps': '#7c3aed'}
+_MODEL_LABELS = {'ecmwf-ens': 'ENS (14d)', 'ecmwf-vareps': 'vareps (44d)'}
+
 
 def _apply_theme(fig: go.Figure) -> go.Figure:
     """Apply the shared dark-navy Plotly theme."""
