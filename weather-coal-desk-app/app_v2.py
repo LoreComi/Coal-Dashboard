@@ -1003,6 +1003,110 @@ def _get_az_credentials() -> tuple[str, str, str] | tuple[None, None, None]:
     return None, None, None
 
 
+_SIG_COLOR = {"BULLISH": "#16a34a", "BEARISH": "#dc2626", "NEUTRAL": "#6b7280"}
+_SIG_ARROW = {"BULLISH": "▲", "BEARISH": "▼", "NEUTRAL": "●"}
+
+_AGENT_META = [
+    ("hurricane",   "🌀 Hurricanes",   "Supply chain risk"),
+    ("kaub",        "🌊 Rhine / Kaub",  "Inland transport"),
+    ("cdd_eu",      "🌡 EU CDD",        "Gas-coal switching"),
+    ("cdd_asia",    "🌡 Asia CDD",      "Coal power demand"),
+    ("china_hydro", "💧 China Hydro",   "Three Gorges"),
+]
+
+
+def _render_market_indexes(kaub_cm, cdd_eu_summary, cdd_asia_summary):
+    """Pre-loaded KPI cards: Kaub level + EU CDD anomaly + Asia CDD anomaly."""
+    cards = []
+
+    # Kaub Rhine level
+    if kaub_cm is not None:
+        if kaub_cm >= 200:
+            k_col, k_status = "#16a34a", "NORMAL"
+        elif kaub_cm >= 130:
+            k_col, k_status = "#d97706", "CONSTRAINED"
+        elif kaub_cm >= 78:
+            k_col, k_status = "#dc2626", "RESTRICTED"
+        else:
+            k_col, k_status = "#7f1d1d", "CRITICAL"
+        cards.append(("Rhine / Kaub", f"{kaub_cm:.0f} cm", k_col, k_status))
+    else:
+        cards.append(("Rhine / Kaub", "N/A", "#9ca3af", "unavailable"))
+
+    # EU CDD anomaly (14-day sum across regions)
+    if cdd_eu_summary:
+        vals = [d.get("anomaly", 0.0) for d in cdd_eu_summary.values()]
+        avg = sum(vals) / len(vals)
+        eu_col = "#dc2626" if avg > 2 else ("#2563eb" if avg < -2 else "#6b7280")
+        eu_status = "WARM" if avg > 2 else ("COOL" if avg < -2 else "NEAR NORMAL")
+        cards.append(("EU CDD Anomaly", f"{avg:+.1f} °C·d", eu_col, eu_status))
+
+    # Asia CDD anomaly
+    if cdd_asia_summary:
+        vals = [d.get("anomaly", 0.0) for d in cdd_asia_summary.values()]
+        avg = sum(vals) / max(len(vals), 1)
+        as_col = "#dc2626" if avg > 3 else ("#2563eb" if avg < -3 else "#6b7280")
+        as_status = "WARM" if avg > 3 else ("COOL" if avg < -3 else "NEAR NORMAL")
+        cards.append(("Asia CDD Anomaly", f"{avg:+.1f} °C·d", as_col, as_status))
+
+    cols = st.columns(len(cards))
+    for i, (label, value, val_col, status) in enumerate(cards):
+        with cols[i]:
+            st.markdown(
+                f'<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;'
+                f'padding:14px 16px;text-align:center;min-height:90px">'
+                f'<div style="font-size:0.68rem;color:#6b7280;font-weight:700;'
+                f'text-transform:uppercase;letter-spacing:0.05em;margin-bottom:5px">{label}</div>'
+                f'<div style="font-size:1.3rem;font-weight:800;color:{val_col};margin-bottom:3px">{value}</div>'
+                f'<div style="font-size:0.7rem;color:{val_col};font-weight:700">{status}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+
+def _render_agent_signal_cards(signals: dict, kaub_cm=None):
+    """One KPI card per specialist agent + full-width overall signal card."""
+    agents = list(_AGENT_META)
+    # replace generic Kaub subtitle with live level if available
+    if kaub_cm is not None:
+        agents[1] = ("kaub", "🌊 Rhine / Kaub", f"{kaub_cm:.0f} cm")
+
+    cols = st.columns(len(agents))
+    for i, (key, label, subtitle) in enumerate(agents):
+        sig = signals.get(key, "NEUTRAL")
+        color = _SIG_COLOR.get(sig, "#6b7280")
+        arrow = _SIG_ARROW.get(sig, "●")
+        with cols[i]:
+            st.markdown(
+                f'<div style="background:#f8fafc;border:1px solid #e2e8f0;'
+                f'border-top:4px solid {color};border-radius:10px;'
+                f'padding:14px 16px;text-align:center">'
+                f'<div style="font-size:0.68rem;color:#6b7280;font-weight:700;'
+                f'text-transform:uppercase;letter-spacing:0.04em;margin-bottom:5px">{label}</div>'
+                f'<div style="font-size:1.05rem;font-weight:800;color:{color};margin-bottom:4px">'
+                f'{arrow} {sig}</div>'
+                f'<div style="font-size:0.7rem;color:#94a3b8">{subtitle}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # Overall signal — full-width coloured bar
+    overall = signals.get("synthesis", "NEUTRAL")
+    o_color = _SIG_COLOR.get(overall, "#6b7280")
+    o_arrow = _SIG_ARROW.get(overall, "●")
+    st.markdown(
+        f'<div style="background:{o_color};border-radius:10px;'
+        f'padding:12px 24px;text-align:center;margin-top:10px">'
+        f'<span style="font-size:0.72rem;color:rgba(255,255,255,0.85);'
+        f'font-weight:700;text-transform:uppercase;letter-spacing:0.07em">'
+        f'OVERALL COAL MARKET SIGNAL&nbsp;&nbsp;</span>'
+        f'<span style="font-size:1.25rem;font-weight:900;color:#ffffff">'
+        f'{o_arrow} {overall}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_coal_brief():
     st.markdown("#### AI COAL MARKET BRIEF")
     st.caption(
@@ -1011,6 +1115,32 @@ def render_coal_brief():
     )
     st.markdown(_BRIEF_CSS, unsafe_allow_html=True)
 
+    # ── Market Indicators (pre-loaded, always visible) ────────────────────────
+    st.markdown(
+        '<div style="font-size:0.75rem;font-weight:700;color:#374151;'
+        'text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">'
+        'MARKET INDICATORS</div>',
+        unsafe_allow_html=True,
+    )
+    with st.spinner("Loading indicators…"):
+        try:
+            _, kaub_cm_pre = _fetch_kaub_level_cached()
+        except Exception:
+            kaub_cm_pre = None
+        try:
+            from _ai_coal_brief import EU_REGIONS, ASIA_REGIONS
+            cdd_eu_pre = _compute_cdd_summary(EU_REGIONS)
+        except Exception:
+            cdd_eu_pre = {}
+        try:
+            cdd_asia_pre = _compute_cdd_summary(ASIA_REGIONS)
+        except Exception:
+            cdd_asia_pre = {}
+    _render_market_indexes(kaub_cm_pre, cdd_eu_pre, cdd_asia_pre)
+
+    st.markdown("---")
+
+    # ── AI Agent Signals ──────────────────────────────────────────────────────
     tenant_id, client_id, client_secret = _get_az_credentials()
     if not all([tenant_id, client_id, client_secret]):
         st.warning(
@@ -1109,6 +1239,21 @@ def render_coal_brief():
 
     from _ai_coal_brief import brief_to_html_bullets
 
+    # ── Agent signal cards ────────────────────────────────────────────────────
+    st.markdown(
+        '<div style="font-size:0.75rem;font-weight:700;color:#374151;'
+        'text-transform:uppercase;letter-spacing:0.05em;margin:12px 0 8px">'
+        'AGENT SIGNALS</div>',
+        unsafe_allow_html=True,
+    )
+    _render_agent_signal_cards(
+        cached.get("signals", {}),
+        kaub_cm=cached.get("kaub_level_cm"),
+    )
+
+    st.markdown("---")
+
+    # ── Synthesis brief ───────────────────────────────────────────────────────
     kaub_str = (f" · Kaub {cached['kaub_level_cm']:.0f} cm"
                 if cached.get("kaub_level_cm") else "")
     st.markdown(f"**Coal Market Brief**{kaub_str} · {cached['generated_at']}")
@@ -1138,6 +1283,13 @@ def render_coal_brief():
 
 
 # ─── Tab: Kaub Levels ────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_kaub_level_cached() -> tuple[list, float | None]:
+    """Cached Kaub level fetch — refreshes every hour."""
+    from _ai_coal_brief import fetch_kaub_levels
+    return fetch_kaub_levels()
+
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def _fetch_kaub_pdf() -> bytes:

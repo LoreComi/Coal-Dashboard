@@ -67,6 +67,11 @@ Given the list of active tropical cyclones:
 
 Format: each bullet starts with "- ". Name the storm, intensity, location,
 and the specific terminal or route at risk.
+
+Last line only — write exactly one of:
+SIGNAL: BULLISH  (storm threatens a coal terminal or key shipping lane — net bullish for prices)
+SIGNAL: BEARISH  (no relevant coal-market threat from current storms)
+SIGNAL: NEUTRAL  (minor or uncertain coal-market impact)
 """
 
 _SYS_KAUB = """\
@@ -91,6 +96,11 @@ Write 1-2 bullet points covering:
   - Bullish or bearish for API#2 ARA coal or European coal-vs-gas spreading
 
 Format: each bullet starts with "- ". Quote the specific level and the threshold context.
+
+Last line only — write exactly one of:
+SIGNAL: BULLISH  (Rhine constraining coal barge transport — supports ARA coal prices)
+SIGNAL: BEARISH  (Rhine at full capacity — no transport constraint premium)
+SIGNAL: NEUTRAL  (situation mixed or not significantly restrictive)
 """
 
 _SYS_CDD_EU = """\
@@ -107,6 +117,11 @@ Write 1-2 bullet points on:
   - Coal switching implication: is coal gaining or losing to gas?
 
 Format: each bullet starts with "- ". Quote specific countries and CDD magnitudes.
+
+Last line only — write exactly one of:
+SIGNAL: BULLISH  (heat raising European gas demand or supporting coal-gas switching toward coal)
+SIGNAL: BEARISH  (cool / below-normal temperatures reducing energy demand)
+SIGNAL: NEUTRAL  (temperature signal mixed or marginal for coal)
 """
 
 _SYS_CDD_ASIA = """\
@@ -125,6 +140,11 @@ Write 1-2 bullet points on:
   - Bullish or bearish for Newcastle index and Indonesian HBA
 
 Format: each bullet starts with "- ". Separate China from Japan/Korea/India where signals differ.
+
+Last line only — write exactly one of:
+SIGNAL: BULLISH  (above-normal heat driving coal power demand — bullish Newcastle / HBA)
+SIGNAL: BEARISH  (below-normal temperatures reducing coal power burn)
+SIGNAL: NEUTRAL  (temperature signal mild or offsetting across regions)
 """
 
 _SYS_CHINA_HYDRO = """\
@@ -151,6 +171,11 @@ Write 1-2 bullet points on:
     (Newcastle index, Indonesian HBA)
 
 Format: each bullet starts with "- ".
+
+Last line only — write exactly one of:
+SIGNAL: BULLISH  (deficient inflows / reduced hydro → China needs more coal)
+SIGNAL: BEARISH  (above-normal inflows / excess hydro → China coal demand reduced)
+SIGNAL: NEUTRAL  (near-normal catchment hydro, marginal coal-demand impact)
 """
 
 _SYS_SYNTHESIS = """\
@@ -173,6 +198,9 @@ Requirements:
   - One stability bullet: primary uncertainty or what would flip this view.
   - No intro sentence. No headers. No conclusion. No numbering.
   - Bullets only, each starting with "- ".
+
+Last line only — write: SIGNAL: BULLISH, SIGNAL: BEARISH, or SIGNAL: NEUTRAL
+(net coal market direction synthesising all five agent signals).
 """
 
 
@@ -342,6 +370,24 @@ def _fmt_china_hydro(
     return "\n".join(lines)
 
 
+# ── Signal extractor ──────────────────────────────────────────────────────────
+
+def _extract_signal(text: str) -> tuple[str, str]:
+    """Remove SIGNAL: line(s) from agent output and return (signal, cleaned_text)."""
+    signal = "NEUTRAL"
+    clean = []
+    for line in text.strip().split("\n"):
+        m = re.match(r"^SIGNAL:\s*(BULLISH|BEARISH|NEUTRAL)\s*$", line.strip(), re.IGNORECASE)
+        if m:
+            signal = m.group(1).upper()
+        else:
+            clean.append(line)
+    # strip trailing blank lines
+    while clean and not clean[-1].strip():
+        clean.pop()
+    return signal, "\n".join(clean)
+
+
 # ── Kaub data fetcher ──────────────────────────────────────────────────────────
 
 def fetch_kaub_levels() -> tuple[list, float | None]:
@@ -454,30 +500,36 @@ def generate_coal_brief(
 
     # ── Step 3: specialist agents (independent, sequential) ───────────────────
     _prog("Hurricane analyst…")
-    brief_hurricane = _llm(client, _SYS_HURRICANE, doc_hurricane, model)
+    sig_hurricane, brief_hurricane = _extract_signal(
+        _llm(client, _SYS_HURRICANE, doc_hurricane, model))
 
     _prog("Kaub analyst…")
-    brief_kaub = _llm(client, _SYS_KAUB, doc_kaub, model)
+    sig_kaub, brief_kaub = _extract_signal(
+        _llm(client, _SYS_KAUB, doc_kaub, model))
 
     _prog("European CDD analyst…")
-    brief_cdd_eu = _llm(client, _SYS_CDD_EU, doc_cdd_eu, model)
+    sig_cdd_eu, brief_cdd_eu = _extract_signal(
+        _llm(client, _SYS_CDD_EU, doc_cdd_eu, model))
 
     _prog("Asia-Pacific CDD analyst…")
-    brief_cdd_asia = _llm(client, _SYS_CDD_ASIA, doc_cdd_asia, model)
+    sig_cdd_asia, brief_cdd_asia = _extract_signal(
+        _llm(client, _SYS_CDD_ASIA, doc_cdd_asia, model))
 
     _prog("China hydro analyst…")
-    brief_hydro = _llm(client, _SYS_CHINA_HYDRO, doc_hydro, model)
+    sig_hydro, brief_hydro = _extract_signal(
+        _llm(client, _SYS_CHINA_HYDRO, doc_hydro, model))
 
     # ── Step 4: synthesis ─────────────────────────────────────────────────────
     _prog("Synthesis agent — writing coal market brief…")
     synthesis_input = "\n\n".join([
-        "=== STORM / HURRICANE SUPPLY RISK ===",      brief_hurricane,
-        "=== RHINE / KAUB TRANSPORT LEVELS ===",      brief_kaub,
-        "=== EUROPEAN CDD / GAS-COAL SWITCHING ===",  brief_cdd_eu,
+        "=== STORM / HURRICANE SUPPLY RISK ===",        brief_hurricane,
+        "=== RHINE / KAUB TRANSPORT LEVELS ===",        brief_kaub,
+        "=== EUROPEAN CDD / GAS-COAL SWITCHING ===",    brief_cdd_eu,
         "=== ASIA-PACIFIC CDD / COAL POWER DEMAND ===", brief_cdd_asia,
-        "=== CHINA THREE GORGES HYDRO ===",            brief_hydro,
+        "=== CHINA THREE GORGES HYDRO ===",             brief_hydro,
     ])
-    brief_synthesis = _llm(client, _SYS_SYNTHESIS, synthesis_input, model, max_tokens=700)
+    sig_synthesis, brief_synthesis = _extract_signal(
+        _llm(client, _SYS_SYNTHESIS, synthesis_input, model, max_tokens=700))
 
     return {
         "hurricane":     brief_hurricane,
@@ -486,6 +538,14 @@ def generate_coal_brief(
         "cdd_asia":      brief_cdd_asia,
         "china_hydro":   brief_hydro,
         "synthesis":     brief_synthesis,
+        "signals": {
+            "hurricane":   sig_hurricane,
+            "kaub":        sig_kaub,
+            "cdd_eu":      sig_cdd_eu,
+            "cdd_asia":    sig_cdd_asia,
+            "china_hydro": sig_hydro,
+            "synthesis":   sig_synthesis,
+        },
         "kaub_level_cm": kaub_level,
         "generated_at":  datetime.utcnow().strftime("%d %b %Y %H:%M UTC"),
     }
