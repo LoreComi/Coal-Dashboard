@@ -580,10 +580,16 @@ def render_anomaly_map():
 
 
 
-# ─── Tab 5: CDD Forecast ─────────────────────────────────────────────────────────
+# ─── Tab 3: CDD Forecast ─────────────────────────────────────────────────────────
+
+_FCST_MODEL_LABELS = {'ecmwf-ens': 'ENS (14d)', 'ecmwf-vareps': 'vareps (44d)'}
+
 def render_cdd_forecast():
     st.markdown("#### CDD FORECAST")
-    st.caption("14-day ECMWF-ENS forecast vs climatology (2000–2024). CDD = max(T_mean − 18°C, 0).")
+    st.caption(
+        "ECMWF-ENS (14d) · ECMWF-vareps (44d) vs ERA5 climatology 2000–2024. "
+        "Bars = daily CDD anomaly vs normal · **Red/orange = warmer** · **Blue/purple = cooler**."
+    )
 
     selected = st.multiselect(
         "Regions", list(REGION_MAP.keys()), DEFAULT_REGIONS,
@@ -593,7 +599,8 @@ def render_cdd_forecast():
         st.info("Select at least one region.")
         return
 
-    summary_rows = []
+    ens_summary = []      # ENS 14d rows for KPI cards
+    all_summary = []      # all-model rows for table
     cols = st.columns(2)
 
     for idx, region in enumerate(selected):
@@ -609,47 +616,74 @@ def render_cdd_forecast():
             clim_temp = compute_temperature_climatology_simple(hist_df)
             clim_cdd = compute_daily_cdd_climatology_v2(hist_df)
 
-            fcst_temp = fcst_df[['date', 'temperature']].copy()
-            fcst_cdd = fcst_df[['date', 'cdd']].copy()
+            has_model = 'model' in fcst_df.columns
+            if has_model:
+                fcst_temp = fcst_df[['date', 'model', 'temperature']].copy()
+                fcst_cdd_df = fcst_df[['date', 'model', 'cdd']].copy()
+            else:
+                fcst_temp = fcst_df[['date', 'temperature']].copy()
+                fcst_cdd_df = fcst_df[['date', 'cdd']].copy()
 
             fig_temp = make_forecast_temperature_chart(region, fcst_temp, clim_temp)
-            fig_dev = make_forecast_cdd_deviation_chart(region, fcst_cdd, clim_cdd)
+            fig_dev = make_forecast_cdd_deviation_chart(region, fcst_cdd_df, clim_cdd)
 
             with cols[idx % 2]:
+                st.markdown(
+                    f'<div style="font-size:0.85rem;font-weight:700;color:#1d4ed8;'
+                    f'letter-spacing:0.04em;text-transform:uppercase;'
+                    f'padding:4px 0 2px;border-bottom:2px solid #e2e8f0;margin-bottom:4px">'
+                    f'{region}</div>',
+                    unsafe_allow_html=True,
+                )
                 st.plotly_chart(fig_temp, use_container_width=True)
                 st.plotly_chart(fig_dev, use_container_width=True)
 
-            # Summary stats for KPI cards
-            if not fcst_cdd.empty and not clim_cdd.empty:
-                fc = fcst_cdd.copy()
-                fc['day_of_year'] = pd.to_datetime(fc['date']).dt.day_of_year
-                merged = fc.merge(clim_cdd, on='day_of_year', how='left')
-                total_fcst = merged['cdd'].sum()
-                total_normal = merged['mean_cdd'].fillna(0).sum()
-                deviation = total_fcst - total_normal
-                summary_rows.append({
-                    'Region': region,
-                    'Fcst CDD': f"{total_fcst:.0f}",
-                    'Normal CDD': f"{total_normal:.0f}",
-                    'Deviation': f"{deviation:+.0f}",
-                    'Days': len(merged),
-                })
+            # Compute summary stats per model
+            if not clim_cdd.empty:
+                model_list = fcst_df['model'].unique().tolist() if has_model else ['forecast']
+                for model in model_list:
+                    mdf = fcst_df[fcst_df['model'] == model][['date', 'cdd']].copy() if has_model else fcst_df[['date', 'cdd']].copy()
+                    if mdf.empty:
+                        continue
+                    mdf['day_of_year'] = pd.to_datetime(mdf['date']).dt.day_of_year
+                    merged = mdf.merge(clim_cdd, on='day_of_year', how='left')
+                    total_fcst = merged['cdd'].sum()
+                    total_normal = merged['mean_cdd'].fillna(0).sum()
+                    deviation = total_fcst - total_normal
+                    label = _FCST_MODEL_LABELS.get(model, model)
+                    row = {
+                        'Region': region,
+                        'Model': label,
+                        'Fcst CDD': f"{total_fcst:.0f}",
+                        'Normal CDD': f"{total_normal:.0f}",
+                        'Deviation': f"{deviation:+.0f}",
+                        'Days': len(merged),
+                    }
+                    all_summary.append(row)
+                    if model == 'ecmwf-ens' or not has_model:
+                        ens_summary.append(row)
+
         except Exception as e:
             with cols[idx % 2]:
                 st.error(f"{region}: {e}")
                 with st.expander("Details"):
                     st.text(traceback.format_exc())
 
-    if summary_rows:
-        st.markdown("---")
-        st.markdown("#### FORECAST SUMMARY")
-        kpi_cols = st.columns(min(len(summary_rows), 6))
-        for i, row in enumerate(summary_rows[:6]):
+    if not all_summary:
+        return
+
+    st.markdown("---")
+    st.markdown("#### FORECAST SUMMARY  <span style='font-size:0.75rem;color:#6b7280;font-weight:400'>ENS 14-day window</span>", unsafe_allow_html=True)
+
+    if ens_summary:
+        kpi_cols = st.columns(min(len(ens_summary), 6))
+        for i, row in enumerate(ens_summary[:6]):
             dev = float(row['Deviation'])
             cls = "kpi-card-warm" if dev > 0 else "kpi-card-cool"
             with kpi_cols[i]:
                 st.markdown(kpi_card(row['Region'], dev, "°C·d vs normal", card_class=cls), unsafe_allow_html=True)
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    st.dataframe(pd.DataFrame(all_summary), use_container_width=True, hide_index=True)
 
 
 # ─── Tab: Gatun Lake ──────────────────────────────────────────────────────────────
@@ -1155,9 +1189,9 @@ def main():
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "Maps & Watersheds",
         "CDD Dashboard",
+        "CDD Forecast",
         "Gatun Lake",
         "Kaub Levels",
-        "CDD Forecast",
         "Hurricanes",
         "Coal Brief",
     ])
@@ -1166,11 +1200,11 @@ def main():
     with tab2:
         render_cdd_dashboard()
     with tab3:
-        render_gatun_lake()
-    with tab4:
-        render_kaub_levels()
-    with tab5:
         render_cdd_forecast()
+    with tab4:
+        render_gatun_lake()
+    with tab5:
+        render_kaub_levels()
     with tab6:
         render_hurricanes()
     with tab7:

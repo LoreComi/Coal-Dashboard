@@ -225,46 +225,59 @@ def make_daily_cdd_bars(city: str, city_data: pd.DataFrame) -> go.Figure:
 # ─── CDD Forecast charts ─────────────────────────────────────────────────────────
 
 def make_forecast_temperature_chart(region: str, fcst_temp: pd.DataFrame, clim_temp: pd.DataFrame) -> go.Figure:
-    """Forecast temperature vs climatological normal with CDD base reference line."""
+    """Forecast temperature vs climatological normal. Handles multi-model data (model column optional)."""
     fig = go.Figure()
 
     if not fcst_temp.empty:
-        fcst_with_doy = fcst_temp.copy()
-        fcst_with_doy['day_of_year'] = pd.to_datetime(fcst_with_doy['date']).dt.day_of_year
+        # Build climatology band over the full date range across all models
+        all_dates = fcst_temp[['date']].drop_duplicates().sort_values('date').copy()
+        all_dates['day_of_year'] = pd.to_datetime(all_dates['date']).dt.day_of_year
 
         if not clim_temp.empty:
-            merged = fcst_with_doy.merge(clim_temp, on='day_of_year', how='left')
+            cband = all_dates.merge(clim_temp, on='day_of_year', how='left').sort_values('date')
             fig.add_trace(go.Scatter(
-                x=merged['date'], y=merged['mean_temp'] + merged['std_temp'],
+                x=cband['date'], y=cband['mean_temp'] + cband['std_temp'],
                 mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip',
             ))
             fig.add_trace(go.Scatter(
-                x=merged['date'], y=(merged['mean_temp'] - merged['std_temp']).clip(lower=0),
+                x=cband['date'], y=(cband['mean_temp'] - cband['std_temp']).clip(lower=0),
                 mode='lines', line=dict(width=0),
                 fill='tonexty', fillcolor='rgba(107,114,128,0.15)',
                 name='Clim ±1σ',
             ))
             fig.add_trace(go.Scatter(
-                x=merged['date'], y=merged['mean_temp'],
+                x=cband['date'], y=cband['mean_temp'],
                 mode='lines', line=dict(color='#9ca3af', dash='dash', width=1.5),
                 name='Clim mean',
             ))
 
-        fig.add_trace(go.Scatter(
-            x=fcst_temp['date'], y=fcst_temp['temperature'],
-            mode='lines+markers', name='Forecast',
-            line=dict(color='#ea580c', width=2.5),
-            marker=dict(size=5),
-        ))
+        if 'model' in fcst_temp.columns:
+            for model in ['ecmwf-ens', 'ecmwf-vareps']:
+                mdf = fcst_temp[fcst_temp['model'] == model].sort_values('date')
+                if mdf.empty:
+                    continue
+                fig.add_trace(go.Scatter(
+                    x=mdf['date'], y=mdf['temperature'],
+                    mode='lines', name=_MODEL_LABELS.get(model, model),
+                    line=dict(color=_MODEL_COLORS.get(model, '#ea580c'), width=2.5,
+                              dash='solid' if model == 'ecmwf-ens' else 'dash'),
+                ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=fcst_temp['date'], y=fcst_temp['temperature'],
+                mode='lines', name='Forecast',
+                line=dict(color='#ea580c', width=2.5),
+            ))
 
     fig.add_hline(y=BASE_TEMP, line_dash='dot', line_color='#16a34a',
                   annotation_text=f"CDD base ({BASE_TEMP}°C)",
                   annotation_font_color='#16a34a')
 
     fig.update_layout(
-        title=dict(text=f"Temperature Forecast — {region}", font=dict(size=14, color='#0f172a')),
-        xaxis_title="Date", yaxis_title="°C",
-        height=340,
+        title=dict(text=f"Temperature Forecast — {region}", font=dict(size=13, color='#0f172a')),
+        xaxis_title=None, yaxis_title="°C",
+        height=310,
+        margin=dict(l=50, r=120, t=40, b=35),
         legend=dict(x=1.01, y=1, xanchor='left', font=dict(size=10, color='#374151'),
                     bgcolor='rgba(255,255,255,0.92)', bordercolor='#e2e8f0', borderwidth=1),
     )
@@ -272,39 +285,50 @@ def make_forecast_temperature_chart(region: str, fcst_temp: pd.DataFrame, clim_t
 
 
 def make_forecast_cdd_deviation_chart(region: str, fcst_cdd: pd.DataFrame, clim_cdd: pd.DataFrame) -> go.Figure:
-    """Overlay bar chart: forecast daily CDD vs historical normal, deviation colored warm/cool."""
+    """Daily CDD deviation from normal (forecast − climatology). Handles multi-model data."""
     fig = go.Figure()
 
-    if not fcst_cdd.empty:
-        fcst_cdd = fcst_cdd.copy()
-        fcst_cdd['day_of_year'] = pd.to_datetime(fcst_cdd['date']).dt.day_of_year
-
-        if not clim_cdd.empty:
-            merged = fcst_cdd.merge(clim_cdd, on='day_of_year', how='left')
+    if not fcst_cdd.empty and not clim_cdd.empty:
+        if 'model' in fcst_cdd.columns:
+            for model in ['ecmwf-ens', 'ecmwf-vareps']:
+                mdf = fcst_cdd[fcst_cdd['model'] == model].copy().sort_values('date')
+                if mdf.empty:
+                    continue
+                mdf['day_of_year'] = pd.to_datetime(mdf['date']).dt.day_of_year
+                merged = mdf.merge(clim_cdd, on='day_of_year', how='left')
+                merged['mean_cdd'] = merged['mean_cdd'].fillna(0)
+                merged['deviation'] = merged['cdd'] - merged['mean_cdd']
+                warm_col = _MODEL_COLORS.get(model, '#ea580c')
+                cool_col = '#2563eb' if model == 'ecmwf-ens' else '#6d28d9'
+                bar_colors = [warm_col if d >= 0 else cool_col for d in merged['deviation']]
+                fig.add_trace(go.Bar(
+                    x=merged['date'], y=merged['deviation'],
+                    name=_MODEL_LABELS.get(model, model),
+                    marker_color=bar_colors, marker_line_width=0,
+                    opacity=0.85 if model == 'ecmwf-ens' else 0.45,
+                ))
+        else:
+            df = fcst_cdd.copy()
+            df['day_of_year'] = pd.to_datetime(df['date']).dt.day_of_year
+            merged = df.merge(clim_cdd, on='day_of_year', how='left')
             merged['mean_cdd'] = merged['mean_cdd'].fillna(0)
             merged['deviation'] = merged['cdd'] - merged['mean_cdd']
-
-            fig.add_trace(go.Bar(
-                x=merged['date'], y=merged['mean_cdd'],
-                name='Normal', marker_color='rgba(156,163,175,0.7)',
-                marker_line_width=0,
-            ))
             bar_colors = ['#dc2626' if d >= 0 else '#2563eb' for d in merged['deviation']]
             fig.add_trace(go.Bar(
-                x=merged['date'], y=merged['cdd'],
-                name='Forecast', marker_color=bar_colors,
-                marker_line_width=0, opacity=0.75,
+                x=merged['date'], y=merged['deviation'],
+                name='Deviation', marker_color=bar_colors, marker_line_width=0, opacity=0.85,
             ))
-        else:
-            fig.add_trace(go.Bar(
-                x=fcst_cdd['date'], y=fcst_cdd['cdd'],
-                name='Forecast CDD', marker_color='#ea580c', marker_line_width=0,
-            ))
+    elif not fcst_cdd.empty:
+        src = fcst_cdd[fcst_cdd['model'] == 'ecmwf-ens'] if 'model' in fcst_cdd.columns else fcst_cdd
+        fig.add_trace(go.Bar(x=src['date'], y=src['cdd'], name='CDD', marker_color='#ea580c'))
+
+    fig.add_hline(y=0, line_color='#94a3b8', line_width=1)
 
     fig.update_layout(
-        title=dict(text=f"Daily CDD vs Normal — {region}", font=dict(size=14, color='#0f172a')),
-        xaxis_title="Date", yaxis_title="CDD (°C·d)",
-        height=280, barmode='overlay',
+        title=dict(text=f"CDD Anomaly vs Normal — {region}", font=dict(size=13, color='#0f172a')),
+        xaxis_title=None, yaxis_title="°C·d deviation",
+        height=250, barmode='overlay',
+        margin=dict(l=50, r=120, t=40, b=35),
         legend=dict(x=1.01, y=1, xanchor='left', font=dict(size=10, color='#374151'),
                     bgcolor='rgba(255,255,255,0.92)', bordercolor='#e2e8f0', borderwidth=1),
     )

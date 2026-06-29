@@ -114,7 +114,7 @@ def load_historical(region: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_forecast(region: str) -> pd.DataFrame:
-    query = f"SELECT date, temperature, cdd FROM {COAL_DESK_SCHEMA}.coal_desk_cdd WHERE region = '{region}' ORDER BY date"
+    query = f"SELECT date, model, temperature, cdd FROM {COAL_DESK_SCHEMA}.coal_desk_cdd WHERE region = '{region}' ORDER BY model, date"
     df = run_query(query)
     if df.empty:
         return df
