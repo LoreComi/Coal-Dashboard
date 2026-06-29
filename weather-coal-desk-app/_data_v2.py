@@ -740,6 +740,34 @@ def load_all_historical_cumulative(historical_cdd: pd.DataFrame) -> dict:
     return result
 
 
+def compute_daily_cdd_climatology_v2(hist_df: pd.DataFrame) -> pd.DataFrame:
+    """Day-of-year mean and std of daily CDD from pre-aggregated historical data (2000–2024)."""
+    if hist_df.empty or 'cdd' not in hist_df.columns:
+        return pd.DataFrame(columns=['day_of_year', 'mean_cdd', 'std_cdd'])
+    df = hist_df[['date', 'cdd']].copy()
+    df['day_of_year'] = pd.to_datetime(df['date']).dt.day_of_year
+    df['year'] = pd.to_datetime(df['date']).dt.year
+    df = df[df['year'].between(HIST_START_YEAR, HIST_END_YEAR)]
+    stats = df.groupby('day_of_year')['cdd'].agg(['mean', 'std']).reset_index()
+    stats.columns = ['day_of_year', 'mean_cdd', 'std_cdd']
+    stats['std_cdd'] = stats['std_cdd'].fillna(0)
+    return stats
+
+
+def compute_temperature_climatology_simple(hist_df: pd.DataFrame) -> pd.DataFrame:
+    """Day-of-year mean and std of temperature from pre-aggregated historical data (2000–2024)."""
+    if hist_df.empty or 'temperature' not in hist_df.columns:
+        return pd.DataFrame(columns=['day_of_year', 'mean_temp', 'std_temp'])
+    df = hist_df[['date', 'temperature']].copy()
+    df['day_of_year'] = pd.to_datetime(df['date']).dt.day_of_year
+    df['year'] = pd.to_datetime(df['date']).dt.year
+    df = df[df['year'].between(HIST_START_YEAR, HIST_END_YEAR)]
+    stats = df.groupby('day_of_year')['temperature'].agg(['mean', 'std']).reset_index()
+    stats.columns = ['day_of_year', 'mean_temp', 'std_temp']
+    stats['std_temp'] = stats['std_temp'].fillna(0)
+    return stats
+
+
 def compute_similar_years(historical_cdd: pd.DataFrame, current_cum: pd.DataFrame, n_similar: int = 5) -> list:
     """Return the n historical years whose CDD trajectory best matches the current year's.
 
