@@ -16,8 +16,8 @@ import streamlit as st
 from _config import (
     CITY_LOCATIONS, POPULATION, REGION_MAP, CITY_TO_REGION,
     BASE_TEMP, SEASON_START_MONTH, SEASON_START_DAY, HIST_START_YEAR, HIST_END_YEAR,
-    TABLE_HIST, TABLE_FCST, CURVE_HIST, CURVE_FCST, MODEL_HIST, MODEL_FCST,
-    TABLE_PRECIP_HIST, TABLE_PRECIP_FCST, CURVE_PRECIP_HIST, CURVE_PRECIP_FCST,
+    TABLE_HIST, TABLE_FCST, TEMP_CLIM, CURVE_HIST, CURVE_FCST, MODEL_HIST, MODEL_FCST,
+    TABLE_PRECIP_HIST, TABLE_PRECIP_FCST, PRECIP_CLIM, CURVE_PRECIP_HIST, CURVE_PRECIP_FCST,
     MODEL_PRECIP_CLIM, CURVE_PRECIP_CLIM,
 )
 
@@ -30,42 +30,27 @@ COAL_DESK_SCHEMA = "dna_snbx_weather.coal_desk"
 
 # ─── Query execution (with SP fallback) ─────────────────────────────────────────
 
+def _get_sp_headers() -> dict:
+    """Build auth headers using the app SP (AZURE_CLIENT_ID M2M credentials)."""
+    from databricks.sdk import WorkspaceClient
+    w = WorkspaceClient()
+    h = {"Content-Type": "application/json"}
+    tok = w.config.authenticate()
+    if isinstance(tok, dict):
+        h.update(tok)
+    elif isinstance(tok, str):
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+
 def run_query(query: str) -> pd.DataFrame:
-    """Execute SQL via Statement API. Falls back to SP token on 403."""
-    user_token = None
-    try:
-        user_token = st.context.headers.get("x-forwarded-access-token")
-    except Exception:
-        pass
+    """Execute SQL via Statement API using the app SP.
 
-    def _get_sp_headers():
-        from databricks.sdk import WorkspaceClient
-        w = WorkspaceClient()
-        h = {"Content-Type": "application/json"}
-        # Try different SDK auth patterns
-        try:
-            tok = w.config.authenticate()
-            if isinstance(tok, dict):
-                h.update(tok)
-            elif isinstance(tok, str):
-                h["Authorization"] = f"Bearer {tok}"
-        except TypeError:
-            pass
-        # Fallback: access token directly from config
-        if "Authorization" not in h:
-            try:
-                h["Authorization"] = f"Bearer {w.config.token}"
-            except Exception:
-                try:
-                    h["Authorization"] = f"Bearer {w.config.host_credentials_provider()().get('Authorization', '')}"
-                except Exception:
-                    pass
-        return h
-
-    if user_token:
-        headers = {"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"}
-    else:
-        headers = _get_sp_headers()
+    Always authenticates as the app service principal (AZURE_CLIENT_ID credentials
+    injected by app.yaml). This ensures consistent access regardless of which user
+    opens the app — no viewer-identity permission issues.
+    """
+    headers = _get_sp_headers()
 
     resp = requests.post(
         f"{DATABRICKS_HOST}/api/2.0/sql/statements/",
@@ -73,16 +58,6 @@ def run_query(query: str) -> pd.DataFrame:
         json={"warehouse_id": WAREHOUSE_ID, "statement": query, "wait_timeout": "50s"},
         timeout=60,
     )
-
-    # Fallback: retry with SP token if user token fails
-    if resp.status_code == 403 and user_token:
-        sp_headers = _get_sp_headers()
-        resp = requests.post(
-            f"{DATABRICKS_HOST}/api/2.0/sql/statements/",
-            headers=sp_headers,
-            json={"warehouse_id": WAREHOUSE_ID, "statement": query, "wait_timeout": "50s"},
-            timeout=60,
-        )
 
     if resp.status_code != 200:
         raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
@@ -147,7 +122,7 @@ def load_anomalies(target_date) -> pd.DataFrame:
     fcst_q = f"SELECT city, AVG(value) as temperature FROM {COAL_DESK_SCHEMA}.coal_desk_forecasts WHERE parameter = 't_mean_2m_24h' AND CAST(date AS DATE) = '{target_str}' GROUP BY city"
     fcst_df = run_query(fcst_q)
 
-    # Fallback to production forecast table if sandbox empty for this date
+    # Fallback to sandbox forecast table if sandbox forecasts empty for this date
     if fcst_df.empty:
         all_cities = list(CITY_LOCATIONS.keys())
         coord_parts = []
@@ -159,8 +134,7 @@ def load_anomalies(target_date) -> pd.DataFrame:
         SELECT CAST(delivery_start AS DATE) as date, AVG(value) as temperature,
                latitude, longitude
         FROM {TABLE_FCST}
-        WHERE model = '{MODEL_FCST}' AND curve_name = '{CURVE_FCST}'
-          AND CAST(delivery_start AS DATE) = '{target_str}'
+        WHERE CAST(delivery_start AS DATE) = '{target_str}'
           AND ({coord_filter})
         GROUP BY CAST(delivery_start AS DATE), latitude, longitude
         """
@@ -183,7 +157,7 @@ def load_anomalies(target_date) -> pd.DataFrame:
 
     fcst_df['region'] = fcst_df['city'].map(CITY_TO_REGION)
 
-    # Get city-level climatology from production ERA5
+    # Get city-level climatology from pre-aggregated sandbox table
     all_cities = list(CITY_LOCATIONS.keys())
     coord_parts = []
     for city in all_cities:
@@ -191,13 +165,10 @@ def load_anomalies(target_date) -> pd.DataFrame:
         coord_parts.append(f"(latitude = {loc['latitude']} AND longitude = {loc['longitude']})")
     coord_filter = " OR ".join(coord_parts)
     clim_q = f"""
-    SELECT AVG(value) as climatology, latitude, longitude
-    FROM {TABLE_HIST}
-    WHERE model = '{MODEL_HIST}' AND curve_name = '{CURVE_HIST}'
-      AND DAYOFYEAR(delivery_start) = {doy}
-      AND YEAR(delivery_start) BETWEEN {HIST_START_YEAR} AND {HIST_END_YEAR}
+    SELECT avg_value as climatology, latitude, longitude
+    FROM {TEMP_CLIM}
+    WHERE day_of_year = {doy}
       AND ({coord_filter})
-    GROUP BY latitude, longitude
     """
     clim_df = run_query(clim_q)
 
@@ -241,8 +212,7 @@ def load_gridded_precip_deviation(map_region: str, start_date, end_date) -> pd.D
     fcst_q = f"""
     SELECT AVG(value) as precipitation, latitude, longitude
     FROM {TABLE_PRECIP_FCST}
-    WHERE model = '{MODEL_FCST}' AND curve_name = '{CURVE_PRECIP_FCST}'
-      AND CAST(delivery_start AS DATE) BETWEEN '{start_str}' AND '{end_str}'
+    WHERE CAST(delivery_start AS DATE) BETWEEN '{start_str}' AND '{end_str}'
       AND latitude BETWEEN {bounds['lat_min']} AND {bounds['lat_max']}
       AND longitude BETWEEN {bounds['lon_min']} AND {bounds['lon_max']}
       AND MOD(CAST(latitude * 2 AS INT), 2) = 0
@@ -258,11 +228,10 @@ def load_gridded_precip_deviation(map_region: str, start_date, end_date) -> pd.D
     doy_start = pd.Timestamp(start_date).day_of_year
     doy_end = pd.Timestamp(end_date).day_of_year
     clim_q = f"""
-    SELECT AVG(value) as climatology, latitude, longitude
-    FROM {TABLE_PRECIP_HIST}
+    SELECT AVG(avg_value) as climatology, latitude, longitude
+    FROM {PRECIP_CLIM}
     WHERE model = '{MODEL_PRECIP_CLIM}' AND curve_name = '{CURVE_PRECIP_CLIM}'
-      AND DAYOFYEAR(delivery_start) BETWEEN {doy_start} AND {doy_end}
-      AND YEAR(delivery_start) BETWEEN {HIST_START_YEAR} AND {HIST_END_YEAR}
+      AND day_of_year BETWEEN {doy_start} AND {doy_end}
       AND latitude BETWEEN {bounds['lat_min']} AND {bounds['lat_max']}
       AND longitude BETWEEN {bounds['lon_min']} AND {bounds['lon_max']}
       AND MOD(CAST(latitude * 2 AS INT), 2) = 0
@@ -292,8 +261,7 @@ def load_gridded_anomalies_multiday(map_region: str, start_date, end_date) -> pd
     fcst_q = f"""
     SELECT AVG(value) as temperature, latitude, longitude
     FROM {TABLE_FCST}
-    WHERE model = '{MODEL_FCST}' AND curve_name = '{CURVE_FCST}'
-      AND CAST(delivery_start AS DATE) BETWEEN '{start_str}' AND '{end_str}'
+    WHERE CAST(delivery_start AS DATE) BETWEEN '{start_str}' AND '{end_str}'
       AND latitude BETWEEN {bounds['lat_min']} AND {bounds['lat_max']}
       AND longitude BETWEEN {bounds['lon_min']} AND {bounds['lon_max']}
       AND MOD(CAST(latitude * 2 AS INT), 2) = 0
@@ -312,11 +280,9 @@ def load_gridded_anomalies_multiday(map_region: str, start_date, end_date) -> pd
     doy_start = pd.Timestamp(start_date).day_of_year
     doy_end = pd.Timestamp(end_date).day_of_year
     clim_q = f"""
-    SELECT AVG(value) as climatology, latitude, longitude
-    FROM {TABLE_HIST}
-    WHERE model = '{MODEL_HIST}' AND curve_name = '{CURVE_HIST}'
-      AND DAYOFYEAR(delivery_start) BETWEEN {doy_start} AND {doy_end}
-      AND YEAR(delivery_start) BETWEEN {HIST_START_YEAR} AND {HIST_END_YEAR}
+    SELECT AVG(avg_value) as climatology, latitude, longitude
+    FROM {TEMP_CLIM}
+    WHERE day_of_year BETWEEN {doy_start} AND {doy_end}
       AND latitude BETWEEN {bounds['lat_min']} AND {bounds['lat_max']}
       AND longitude BETWEEN {bounds['lon_min']} AND {bounds['lon_max']}
       AND MOD(CAST(latitude * 2 AS INT), 2) = 0
@@ -348,8 +314,7 @@ def load_gridded_anomalies(map_region: str, target_date) -> pd.DataFrame:
     fcst_q = f"""
     SELECT AVG(value) as temperature, latitude, longitude
     FROM {TABLE_FCST}
-    WHERE model = '{MODEL_FCST}' AND curve_name = '{CURVE_FCST}'
-      AND CAST(delivery_start AS DATE) = '{target_str}'
+    WHERE CAST(delivery_start AS DATE) = '{target_str}'
       AND latitude BETWEEN {bounds['lat_min']} AND {bounds['lat_max']}
       AND longitude BETWEEN {bounds['lon_min']} AND {bounds['lon_max']}
       AND MOD(CAST(latitude * 2 AS INT), 4) = 0
@@ -364,18 +329,15 @@ def load_gridded_anomalies(map_region: str, target_date) -> pd.DataFrame:
     fcst_df['latitude'] = fcst_df['latitude'].astype(float)
     fcst_df['longitude'] = fcst_df['longitude'].astype(float)
 
-    # Climatology (ERA5 day-of-year average 2000-2024, same grid)
+    # Climatology (pre-aggregated ERA5 day-of-year average, same grid)
     clim_q = f"""
-    SELECT AVG(value) as climatology, latitude, longitude
-    FROM {TABLE_HIST}
-    WHERE model = '{MODEL_HIST}' AND curve_name = '{CURVE_HIST}'
-      AND DAYOFYEAR(delivery_start) = {doy}
-      AND YEAR(delivery_start) BETWEEN {HIST_START_YEAR} AND {HIST_END_YEAR}
+    SELECT avg_value as climatology, latitude, longitude
+    FROM {TEMP_CLIM}
+    WHERE day_of_year = {doy}
       AND latitude BETWEEN {bounds['lat_min']} AND {bounds['lat_max']}
       AND longitude BETWEEN {bounds['lon_min']} AND {bounds['lon_max']}
       AND MOD(CAST(latitude * 2 AS INT), 4) = 0
       AND MOD(CAST(longitude * 2 AS INT), 4) = 0
-    GROUP BY latitude, longitude
     """
     clim_df = run_query(clim_q)
     if clim_df.empty:
@@ -455,8 +417,7 @@ def load_current_year_cdd_bulk(regions: tuple) -> pd.DataFrame:
     SELECT CAST(delivery_start AS DATE) as date, value as temperature,
            latitude, longitude
     FROM {TABLE_HIST}
-    WHERE model = '{MODEL_HIST}' AND curve_name = '{CURVE_HIST}'
-      AND delivery_start >= '{season_start}'
+    WHERE delivery_start >= '{season_start}'
       AND ({coord_filter})
     ORDER BY delivery_start
     """
@@ -464,8 +425,7 @@ def load_current_year_cdd_bulk(regions: tuple) -> pd.DataFrame:
     SELECT CAST(delivery_start AS DATE) as date, AVG(value) as temperature,
            latitude, longitude
     FROM {TABLE_FCST}
-    WHERE model = '{MODEL_FCST}' AND curve_name = '{CURVE_FCST}'
-      AND CAST(delivery_start AS DATE) >= '{gap_start}'
+    WHERE CAST(delivery_start AS DATE) >= '{gap_start}'
       AND ({coord_filter})
     GROUP BY CAST(delivery_start AS DATE), latitude, longitude
     ORDER BY date
@@ -537,8 +497,7 @@ def load_current_year_cdd(region: str) -> pd.DataFrame:
     SELECT CAST(delivery_start AS DATE) as date, value as temperature,
            latitude, longitude
     FROM {TABLE_HIST}
-    WHERE model = '{MODEL_HIST}' AND curve_name = '{CURVE_HIST}'
-      AND delivery_start >= '{season_start}'
+    WHERE delivery_start >= '{season_start}'
       AND ({coord_filter})
     ORDER BY delivery_start
     """
@@ -549,8 +508,7 @@ def load_current_year_cdd(region: str) -> pd.DataFrame:
     SELECT CAST(delivery_start AS DATE) as date, AVG(value) as temperature,
            latitude, longitude
     FROM {TABLE_FCST}
-    WHERE model = '{MODEL_FCST}' AND curve_name = '{CURVE_FCST}'
-      AND CAST(delivery_start AS DATE) >= '{gap_start}'
+    WHERE CAST(delivery_start AS DATE) >= '{gap_start}'
       AND ({coord_filter})
     GROUP BY CAST(delivery_start AS DATE), latitude, longitude
     ORDER BY date
@@ -628,8 +586,7 @@ def load_forecast_spread_bulk(regions: tuple) -> pd.DataFrame:
            PERCENTILE(value, 0.75) as temp_p75,
            latitude, longitude
     FROM {TABLE_FCST}
-    WHERE model = '{MODEL_FCST}' AND curve_name = '{CURVE_FCST}'
-      AND delivery_start >= CURRENT_DATE()
+    WHERE delivery_start >= CURRENT_DATE()
       AND ({coord_filter})
     GROUP BY CAST(delivery_start AS DATE), latitude, longitude
     ORDER BY date
@@ -839,19 +796,17 @@ def load_watershed_precip(region_name: str):
     fcst_q = f"""
     SELECT CAST(delivery_start AS DATE) as date, AVG(value) as precipitation
     FROM {TABLE_PRECIP_FCST}
-    WHERE model = '{MODEL_FCST}' AND curve_name = '{CURVE_PRECIP_FCST}'
-      AND delivery_start >= CURRENT_DATE()
+    WHERE delivery_start >= CURRENT_DATE()
       AND {box}
     GROUP BY CAST(delivery_start AS DATE) ORDER BY date
     """
     clim_q = f"""
-    SELECT DAYOFYEAR(delivery_start) as doy,
-           AVG(value) as mean_precip, STDDEV(value) as std_precip
-    FROM {TABLE_PRECIP_HIST}
+    SELECT day_of_year as doy,
+           AVG(avg_value) as mean_precip, AVG(std_value) as std_precip
+    FROM {PRECIP_CLIM}
     WHERE model = '{MODEL_PRECIP_CLIM}' AND curve_name = '{CURVE_PRECIP_CLIM}'
-      AND YEAR(delivery_start) BETWEEN {HIST_START_YEAR} AND {HIST_END_YEAR}
       AND {box}
-    GROUP BY DAYOFYEAR(delivery_start) ORDER BY doy
+    GROUP BY day_of_year ORDER BY doy
     """
 
     hist_df = run_query(hist_q)

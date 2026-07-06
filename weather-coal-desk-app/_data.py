@@ -24,40 +24,31 @@ DATABRICKS_HOST = _raw_host if _raw_host.startswith("https://") else f"https://{
 WAREHOUSE_ID = os.environ.get("DATABRICKS_SQL_WAREHOUSE_HTTP_PATH", "").split("/")[-1]
 
 
-# ─── Low-level query (databricks-sdk + user token fallback) ──────────────────────
+# ─── Low-level query (always uses app SP via SDK — no user token) ───────────────
 
-def _get_token() -> str:
-    """Get the best available token: user forwarded token or SDK default."""
-    # Try user-forwarded token first (has user's permissions)
-    try:
-        user_token = st.context.headers.get("x-forwarded-access-token")
-        if user_token:
-            return user_token
-    except Exception:
-        pass
-    # Fallback: use the app service principal's token via SDK
+def _get_sp_token() -> str:
+    """Get an access token from the app service principal (via SDK M2M auth)."""
     from databricks.sdk import WorkspaceClient
     w = WorkspaceClient()
-    return w.config.authenticate()
+    tok = w.config.authenticate()
+    if isinstance(tok, str):
+        return tok
+    # SDK may return a header dict instead of a raw token string
+    auth_header = tok.get("Authorization", "") if isinstance(tok, dict) else ""
+    if auth_header.startswith("Bearer "):
+        return auth_header[len("Bearer "):]
+    raise RuntimeError("Could not obtain SP token from SDK")
 
 
 def run_query(query: str) -> pd.DataFrame:
-    """Execute SQL via the Databricks Statement Execution API."""
-    # Try user token first, then fall back to SP token
-    user_token = None
-    try:
-        user_token = st.context.headers.get("x-forwarded-access-token")
-    except Exception:
-        pass
+    """Execute SQL via the Databricks Statement Execution API using the app SP.
 
-    if user_token:
-        headers = {"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"}
-    else:
-        # Use databricks-sdk default auth (app service principal)
-        from databricks.sdk import WorkspaceClient
-        w = WorkspaceClient()
-        headers = {"Content-Type": "application/json"}
-        headers.update(w.api_client.default_headers)
+    Always authenticates as the app service principal (AZURE_CLIENT_ID credentials
+    injected by app.yaml). This ensures consistent access regardless of which user
+    opens the app — no viewer-identity permission issues.
+    """
+    token = _get_sp_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     resp = requests.post(
         f"{DATABRICKS_HOST}/api/2.0/sql/statements/",
@@ -65,19 +56,6 @@ def run_query(query: str) -> pd.DataFrame:
         json={"warehouse_id": WAREHOUSE_ID, "statement": query, "wait_timeout": "50s"},
         timeout=60,
     )
-
-    # If user token fails with 403, retry with SP token
-    if resp.status_code == 403 and user_token:
-        from databricks.sdk import WorkspaceClient
-        w = WorkspaceClient()
-        sp_headers = {"Content-Type": "application/json"}
-        sp_headers.update(w.api_client.default_headers)
-        resp = requests.post(
-            f"{DATABRICKS_HOST}/api/2.0/sql/statements/",
-            headers=sp_headers,
-            json={"warehouse_id": WAREHOUSE_ID, "statement": query, "wait_timeout": "50s"},
-            timeout=60,
-        )
 
     if resp.status_code != 200:
         raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")

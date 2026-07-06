@@ -11,17 +11,19 @@ SEASON_START_DAY = 15
 HIST_START_YEAR = 2000
 HIST_END_YEAR = 2024
 
-# Source tables — Temperature
-TABLE_HIST = "dna_prod_silver.meteomatics.temperature"
-TABLE_FCST = "dna_prod_silver.meteomatics.temperature_forecast"
+# Source tables — Temperature (sandbox, no prod dependency)
+TABLE_HIST = "dna_snbx_weather.coal_desk.temperature_actuals"
+TABLE_FCST = "dna_snbx_weather.coal_desk.temperature_forecast"
+TEMP_CLIM = "dna_snbx_weather.coal_desk.temperature_climatology"
 CURVE_HIST = "t_mean_2m_24h_c_ecmwf_era5_p1d"
 CURVE_FCST = "t_mean_2m_24h_c_ecmwf_ens_p1d"
 MODEL_HIST = "ecmwf-era5"
 MODEL_FCST = "ecmwf-ens"
 
-# Source tables — Precipitation
-TABLE_PRECIP_HIST = "dna_prod_silver.meteomatics.precipitation"
-TABLE_PRECIP_FCST = "dna_prod_silver.meteomatics.precipitation_forecast"
+# Source tables — Precipitation (sandbox, no prod dependency)
+TABLE_PRECIP_HIST = "dna_snbx_weather.coal_desk.precipitation_actuals"
+TABLE_PRECIP_FCST = "dna_snbx_weather.coal_desk.precipitation_forecast"
+PRECIP_CLIM = "dna_snbx_weather.coal_desk.precipitation_climatology"
 CURVE_PRECIP_HIST = "precip_24h_mm_ecmwf_era5_p1d"
 CURVE_PRECIP_FCST = "precip_24h_mm_ecmwf_ens_p1d"
 # Precipitation climatology uses 'mix' model (1978–2025 long record)

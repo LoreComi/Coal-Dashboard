@@ -544,6 +544,9 @@ def render_anomaly_map():
                         'RdBu_r', np.linspace(-10, 10, 21), 'T2m Anomaly (°C)',
                         has_cartopy, figsize=(5, 4),
                     )
+                    import matplotlib.pyplot as plt
+                    st.pyplot(fig_mpl, use_container_width=True)
+                    plt.close(fig_mpl)
                 else:
                     try:
                         df = load_gridded_precip_deviation(map_region, p_start, p_end)
@@ -560,10 +563,9 @@ def render_anomaly_map():
                         'BrBG', np.linspace(-8, 8, 17), 'Precip Deviation (mm/day)',
                         has_cartopy, figsize=(5, 4), extra_draw=overlay,
                     )
-
-            st.pyplot(fig_mpl, use_container_width=True)
-            import matplotlib.pyplot as plt
-            plt.close(fig_mpl)
+                    import matplotlib.pyplot as plt
+                    st.pyplot(fig_mpl, use_container_width=True)
+                    plt.close(fig_mpl)
 
     # ── Three Gorges / Yangtze catchment (East Asia + Precipitation) ──────────
     if map_region == 'East Asia' and variable == 'Precipitation':
