@@ -17,9 +17,10 @@ from _config import (
     REGION_MAP, CITY_LOCATIONS, POPULATION, CITY_TO_REGION,
     BASE_TEMP, DEFAULT_REGIONS,
 )
+from _config import TABLE_FCST_VAREPS
 from _data_v2 import (
     load_historical, load_forecast, load_city_timeseries, load_anomalies,
-    compute_region_cdd, compute_cumulative, compute_normal,
+    compute_region_cdd, compute_cumulative, compute_normal, compute_five_year_avg,
     load_precomputed_cdd, load_precomputed_historical, load_precomputed_forecasts,
     load_current_year_cdd, load_gridded_anomalies, load_gridded_anomalies_multiday,
     load_gridded_precip_deviation, MAP_REGIONS,
@@ -27,7 +28,8 @@ from _data_v2 import (
     load_watershed_precip, load_gatun_lake_levels, load_hurricane_data,
     THREE_GORGES_DAM,
     load_current_year_cdd_bulk, load_forecast_spread_bulk, compute_ensemble_spread,
-    compute_daily_cdd_climatology_v2, compute_temperature_climatology_simple,
+    compute_daily_cdd_climatology_v2, compute_daily_cdd_five_year_avg,
+    compute_temperature_climatology_simple,
 )
 from _charts import (
     make_cumulative_cdd_chart, make_temperature_chart,
@@ -87,8 +89,9 @@ def render_cdd_dashboard():
     except Exception:
         spread_bulk = pd.DataFrame()
 
-    cols = st.columns(2)
-    for idx, region in enumerate(selected):
+    # ── First pass: compute each region's chart + summary stats ───────────────
+    figs = []  # (region, fig) on success, (region, error_str) on failure
+    for region in selected:
         try:
             # Historical CDD (2000-2024) for normal / prev year / similar years
             if not precomp_hist.empty and region in precomp_hist['region'].values:
@@ -106,6 +109,7 @@ def render_cdd_dashboard():
             cum_current = compute_cumulative(combined, current_year)
             cum_prev = compute_cumulative(region_cdd, current_year - 1)
             normal = compute_normal(region_cdd)
+            five_yr = compute_five_year_avg(region_cdd)
 
             all_hist_cum = load_all_historical_cumulative(region_cdd)
             sim_years = compute_similar_years(region_cdd, cum_current)
@@ -118,28 +122,57 @@ def render_cdd_dashboard():
                 all_historical_cumulative=all_hist_cum,
                 similar_years=sim_years,
                 ensemble_spread=ensemble_spread,
+                five_year_avg=five_yr,
             )
-            with cols[idx % 2]:
-                st.plotly_chart(fig, use_container_width=True)
+            figs.append((region, fig))
 
-            total = cum_current['cumulative_cdd'].iloc[-1] if not cum_current.empty else 0
+            total = float(cum_current['cumulative_cdd'].iloc[-1]) if not cum_current.empty else 0.0
             n_days = len(cum_current)
-            nv = normal.loc[normal['day_of_season'] == n_days, 'mean'].values
-            normal_val = nv[0] if len(nv) else 0
-            summary_rows.append({'Region': region, 'CDD': f"{total:.0f}", 'Normal': f"{normal_val:.0f}", 'Anomaly': f"{total-normal_val:+.0f}", 'Days': n_days})
-        except Exception as e:
-            with cols[idx % 2]:
-                st.error(f"{region}: {e}")
 
+            def _at_day(stats_df):
+                if stats_df.empty or n_days == 0:
+                    return 0.0
+                v = stats_df.loc[stats_df['day_of_season'] == n_days, 'mean'].values
+                return float(v[0]) if len(v) else float(stats_df['mean'].iloc[-1])
+
+            normal_val = _at_day(normal)
+            five_val = _at_day(five_yr)
+            summary_rows.append({
+                'Region': region, 'CDD': total, 'Normal': normal_val,
+                'Anomaly': total - normal_val, '5yr Avg': five_val,
+                'vs 5yr': total - five_val,
+            })
+        except Exception as e:
+            figs.append((region, f"{e}"))
+
+    # ── Season summary at the TOP ─────────────────────────────────────────────
     if summary_rows:
-        st.markdown("---")
         st.markdown("#### SEASON SUMMARY")
         kpi_cols = st.columns(min(len(summary_rows), 6))
         for i, row in enumerate(summary_rows[:6]):
-            a = float(row['Anomaly'])
+            a = row['Anomaly']
             with kpi_cols[i]:
                 st.markdown(kpi_card(row['Region'], a, "°C·d", card_class="kpi-card-warm" if a > 0 else "kpi-card-cool"), unsafe_allow_html=True)
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+        disp = pd.DataFrame(summary_rows)
+        disp = disp.assign(
+            CDD=disp['CDD'].map(lambda v: f"{v:.0f}"),
+            Normal=disp['Normal'].map(lambda v: f"{v:.0f}"),
+            Anomaly=disp['Anomaly'].map(lambda v: f"{v:+.0f}"),
+            **{'5yr Avg': disp['5yr Avg'].map(lambda v: f"{v:.0f}"),
+               'vs 5yr': disp['vs 5yr'].map(lambda v: f"{v:+.0f}")},
+        )[['Region', 'CDD', 'Normal', 'Anomaly', '5yr Avg', 'vs 5yr']]
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+        st.markdown("---")
+
+    # ── Cumulative CDD charts ─────────────────────────────────────────────────
+    cols = st.columns(2)
+    for idx, (region, fig) in enumerate(figs):
+        with cols[idx % 2]:
+            if isinstance(fig, str):
+                st.error(f"{region}: {fig}")
+            else:
+                st.plotly_chart(fig, use_container_width=True)
 
 
 # ─── Tab 2: Forecast Overview ───────────────────────────────────────────────────
@@ -493,8 +526,33 @@ def _render_gatun_lake_chart(hist_df: pd.DataFrame, proj_df: pd.DataFrame):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _render_temp_anomaly_tile(map_region, bounds, p_start, p_end, label,
+                              has_cartopy, source_table):
+    """Load + draw one gridded T2m-anomaly map tile. Returns True if a map was drawn."""
+    try:
+        df = load_gridded_anomalies_multiday(map_region, p_start, p_end, source_table=source_table)
+    except Exception as e:
+        st.error(str(e)); return False
+    if df.empty:
+        st.warning("No data"); return False
+    lats_s = np.sort(df['latitude'].unique())
+    lons_s = np.sort(df['longitude'].unique())
+    data_2d = (df.pivot_table(index='latitude', columns='longitude', values='anomaly')
+                 .reindex(index=lats_s, columns=lons_s).values)
+    fig_mpl = _make_map_fig(
+        lons_s, lats_s, data_2d, bounds, label,
+        'RdBu_r', np.linspace(-10, 10, 21), 'T2m Anomaly (°C)',
+        has_cartopy, figsize=(5, 4),
+    )
+    import matplotlib.pyplot as plt
+    st.pyplot(fig_mpl, use_container_width=True)
+    plt.close(fig_mpl)
+    return True
+
+
 def render_anomaly_map():
-    st.caption("Gridded forecast deviation from ERA5 climatology (2000–2024). Data: ECMWF-ENS.")
+    st.caption("Gridded forecast deviation from ERA5 climatology (2000–2024). "
+               "Near term: ECMWF-ENS (14d). Extended weeks 3–6 (Temperature): ECMWF-vareps (44d).")
 
     import matplotlib
     matplotlib.use('Agg')
@@ -522,31 +580,16 @@ def render_anomaly_map():
 
     overlay = _draw_three_gorges if (map_region == 'East Asia' and variable == 'Precipitation') else None
 
-    # ── Three maps side by side ────────────────────────────────────────────────
+    # ── Near term: three 5-day maps side by side (ECMWF-ENS) ──────────────────
+    st.markdown("###### NEAR TERM — DAYS 1–15  ·  ECMWF-ENS")
     map_cols = st.columns(3)
     for i, (p_start, p_end) in enumerate(periods):
         period_label = f"{p_start:%d %b} – {p_end:%d %b}"
         with map_cols[i]:
             with st.spinner(f"Days {i*5+1}–{(i+1)*5}…"):
                 if variable == "Temperature":
-                    try:
-                        df = load_gridded_anomalies_multiday(map_region, p_start, p_end)
-                    except Exception as e:
-                        st.error(str(e)); continue
-                    if df.empty:
-                        st.warning("No data"); continue
-                    lats_s = np.sort(df['latitude'].unique())
-                    lons_s = np.sort(df['longitude'].unique())
-                    data_2d = (df.pivot_table(index='latitude', columns='longitude', values='anomaly')
-                                 .reindex(index=lats_s, columns=lons_s).values)
-                    fig_mpl = _make_map_fig(
-                        lons_s, lats_s, data_2d, bounds, period_label,
-                        'RdBu_r', np.linspace(-10, 10, 21), 'T2m Anomaly (°C)',
-                        has_cartopy, figsize=(5, 4),
-                    )
-                    import matplotlib.pyplot as plt
-                    st.pyplot(fig_mpl, use_container_width=True)
-                    plt.close(fig_mpl)
+                    _render_temp_anomaly_tile(map_region, bounds, p_start, p_end,
+                                              period_label, has_cartopy, TABLE_FCST)
                 else:
                     try:
                         df = load_gridded_precip_deviation(map_region, p_start, p_end)
@@ -566,6 +609,40 @@ def render_anomaly_map():
                     import matplotlib.pyplot as plt
                     st.pyplot(fig_mpl, use_container_width=True)
                     plt.close(fig_mpl)
+
+    # ── Extended range: weekly maps (weeks 3–6) from ECMWF-vareps 44d ──────────
+    # Temperature only — vareps precipitation is not ingested to the sandbox.
+    if variable == "Temperature":
+        st.markdown("###### EXTENDED RANGE — WEEKS 3–6  ·  ECMWF-vareps (44d)")
+        ext_periods = [
+            (wk, today_d + timedelta(days=7 * (wk - 1)), today_d + timedelta(days=7 * wk - 1))
+            for wk in (3, 4, 5, 6)
+        ]
+        # Probe week 3 first: if the vareps table is absent/empty, show one note
+        # instead of four separate errors.
+        try:
+            probe = load_gridded_anomalies_multiday(
+                map_region, ext_periods[0][1], ext_periods[0][2], source_table=TABLE_FCST_VAREPS)
+            probe_ok = True
+        except Exception:
+            probe, probe_ok = None, False
+
+        if not probe_ok:
+            st.info(
+                "Extended-range (ECMWF-vareps) maps are unavailable — the "
+                "`temperature_forecast_vareps` sandbox table has not been populated yet. "
+                "Re-run the sandbox refresh pipeline to enable weeks 3–6."
+            )
+        elif probe is not None and probe.empty:
+            st.warning("No extended-range vareps data for this region/date range yet.")
+        else:
+            ext_cols = st.columns(4)
+            for j, (wk, w_start, w_end) in enumerate(ext_periods):
+                week_label = f"Week {wk}: {w_start:%d %b} – {w_end:%d %b}"
+                with ext_cols[j]:
+                    with st.spinner(f"Week {wk}…"):
+                        _render_temp_anomaly_tile(map_region, bounds, w_start, w_end,
+                                                  week_label, has_cartopy, TABLE_FCST_VAREPS)
 
     # ── Three Gorges / Yangtze catchment (East Asia + Precipitation) ──────────
     if map_region == 'East Asia' and variable == 'Precipitation':
@@ -601,22 +678,24 @@ def render_cdd_forecast():
         st.info("Select at least one region.")
         return
 
-    ens_summary = []      # ENS 14d rows for KPI cards
-    all_summary = []      # all-model rows for table
-    cols = st.columns(2)
+    ens_rows = []       # ENS rows (one per region) — also drives KPI cards
+    vareps_rows = []    # vareps rows (one per region)
+    other_rows = []     # fallback when the forecast has no model column
+    figs = []           # (region, fig_temp, fig_dev) on success, (region, err) on failure
 
-    for idx, region in enumerate(selected):
+    # ── First pass: build each region's charts + per-model summary rows ────────
+    for region in selected:
         try:
             hist_df = load_historical(region)
             fcst_df = load_forecast(region)
 
             if fcst_df.empty:
-                with cols[idx % 2]:
-                    st.warning(f"No forecast data for {region}.")
+                figs.append((region, "No forecast data."))
                 continue
 
             clim_temp = compute_temperature_climatology_simple(hist_df)
             clim_cdd = compute_daily_cdd_climatology_v2(hist_df)
+            clim_cdd_5yr = compute_daily_cdd_five_year_avg(hist_df)
 
             has_model = 'model' in fcst_df.columns
             if has_model:
@@ -628,64 +707,96 @@ def render_cdd_forecast():
 
             fig_temp = make_forecast_temperature_chart(region, fcst_temp, clim_temp)
             fig_dev = make_forecast_cdd_deviation_chart(region, fcst_cdd_df, clim_cdd)
+            figs.append((region, fig_temp, fig_dev))
 
-            with cols[idx % 2]:
-                st.markdown(
-                    f'<div style="font-size:0.85rem;font-weight:700;color:#1d4ed8;'
-                    f'letter-spacing:0.04em;text-transform:uppercase;'
-                    f'padding:4px 0 2px;border-bottom:2px solid #e2e8f0;margin-bottom:4px">'
-                    f'{region}</div>',
-                    unsafe_allow_html=True,
-                )
-                st.plotly_chart(fig_temp, use_container_width=True)
-                st.plotly_chart(fig_dev, use_container_width=True)
-
-            # Compute summary stats per model
+            # Per-model summary stats (forecast total vs normal AND vs 5-yr avg)
             if not clim_cdd.empty:
                 model_list = fcst_df['model'].unique().tolist() if has_model else ['forecast']
                 for model in model_list:
-                    mdf = fcst_df[fcst_df['model'] == model][['date', 'cdd']].copy() if has_model else fcst_df[['date', 'cdd']].copy()
+                    mdf = (fcst_df[fcst_df['model'] == model][['date', 'cdd']].copy()
+                           if has_model else fcst_df[['date', 'cdd']].copy())
                     if mdf.empty:
                         continue
                     mdf['day_of_year'] = pd.to_datetime(mdf['date']).dt.day_of_year
-                    merged = mdf.merge(clim_cdd, on='day_of_year', how='left')
-                    total_fcst = merged['cdd'].sum()
-                    total_normal = merged['mean_cdd'].fillna(0).sum()
-                    deviation = total_fcst - total_normal
-                    label = _FCST_MODEL_LABELS.get(model, model)
+                    merged = mdf.merge(clim_cdd[['day_of_year', 'mean_cdd']], on='day_of_year', how='left')
+                    merged = merged.merge(
+                        clim_cdd_5yr[['day_of_year', 'mean_cdd']].rename(columns={'mean_cdd': 'mean_cdd_5yr'}),
+                        on='day_of_year', how='left',
+                    )
+                    total_fcst = float(merged['cdd'].sum())
+                    total_normal = float(merged['mean_cdd'].fillna(0).sum())
+                    total_5yr = float(merged['mean_cdd_5yr'].fillna(0).sum())
                     row = {
                         'Region': region,
-                        'Model': label,
-                        'Fcst CDD': f"{total_fcst:.0f}",
-                        'Normal CDD': f"{total_normal:.0f}",
-                        'Deviation': f"{deviation:+.0f}",
+                        'Model': _FCST_MODEL_LABELS.get(model, model),
+                        'Fcst CDD': total_fcst,
+                        'Normal CDD': total_normal,
+                        'Dev vs Normal': total_fcst - total_normal,
+                        '5yr Avg CDD': total_5yr,
+                        'Dev vs 5yr': total_fcst - total_5yr,
                         'Days': len(merged),
                     }
-                    all_summary.append(row)
-                    if model == 'ecmwf-ens' or not has_model:
-                        ens_summary.append(row)
+                    if model == 'ecmwf-ens':
+                        ens_rows.append(row)
+                    elif model == 'ecmwf-vareps':
+                        vareps_rows.append(row)
+                    else:
+                        other_rows.append(row)
 
         except Exception as e:
-            with cols[idx % 2]:
-                st.error(f"{region}: {e}")
-                with st.expander("Details"):
-                    st.text(traceback.format_exc())
+            figs.append((region, f"{e}\n{traceback.format_exc()}"))
 
-    if not all_summary:
-        return
+    # ── Forecast summary at the TOP (ENS models first, then vareps) ───────────
+    all_rows = ens_rows + vareps_rows + other_rows
+    if all_rows:
+        st.markdown(
+            "#### FORECAST SUMMARY  <span style='font-size:0.75rem;color:#6b7280;font-weight:400'>"
+            "vs 2000–24 normal &amp; trailing 5-yr avg · ENS (14d) then vareps (44d)</span>",
+            unsafe_allow_html=True,
+        )
 
-    st.markdown("---")
-    st.markdown("#### FORECAST SUMMARY  <span style='font-size:0.75rem;color:#6b7280;font-weight:400'>ENS 14-day window</span>", unsafe_allow_html=True)
+        kpi_source = ens_rows or other_rows
+        if kpi_source:
+            kpi_cols = st.columns(min(len(kpi_source), 6))
+            for i, row in enumerate(kpi_source[:6]):
+                dev = row['Dev vs Normal']
+                cls = "kpi-card-warm" if dev > 0 else "kpi-card-cool"
+                with kpi_cols[i]:
+                    st.markdown(kpi_card(row['Region'], dev, "°C·d vs normal", card_class=cls), unsafe_allow_html=True)
 
-    if ens_summary:
-        kpi_cols = st.columns(min(len(ens_summary), 6))
-        for i, row in enumerate(ens_summary[:6]):
-            dev = float(row['Deviation'])
-            cls = "kpi-card-warm" if dev > 0 else "kpi-card-cool"
-            with kpi_cols[i]:
-                st.markdown(kpi_card(row['Region'], dev, "°C·d vs normal", card_class=cls), unsafe_allow_html=True)
+        disp = pd.DataFrame(all_rows)
+        for col, fmt in [('Fcst CDD', '{:.0f}'), ('Normal CDD', '{:.0f}'), ('5yr Avg CDD', '{:.0f}'),
+                         ('Dev vs Normal', '{:+.0f}'), ('Dev vs 5yr', '{:+.0f}')]:
+            disp[col] = disp[col].map(lambda v, f=fmt: f.format(v))
+        disp = disp[['Region', 'Model', 'Fcst CDD', 'Normal CDD', 'Dev vs Normal',
+                     '5yr Avg CDD', 'Dev vs 5yr', 'Days']]
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+        st.markdown("---")
 
-    st.dataframe(pd.DataFrame(all_summary), use_container_width=True, hide_index=True)
+    # ── Per-region forecast charts ────────────────────────────────────────────
+    cols = st.columns(2)
+    for idx, item in enumerate(figs):
+        region = item[0]
+        with cols[idx % 2]:
+            if len(item) == 2:  # error or warning string
+                msg = item[1]
+                if msg.startswith("No forecast data"):
+                    st.warning(f"{region}: {msg}")
+                else:
+                    st.error(f"{region}: {msg.splitlines()[0]}")
+                    with st.expander("Details"):
+                        st.text(msg)
+                continue
+            _, fig_temp, fig_dev = item
+            st.markdown(
+                f'<div style="font-size:0.85rem;font-weight:700;color:#1d4ed8;'
+                f'letter-spacing:0.04em;text-transform:uppercase;'
+                f'padding:4px 0 2px;border-bottom:2px solid #e2e8f0;margin-bottom:4px">'
+                f'{region}</div>',
+                unsafe_allow_html=True,
+            )
+            st.plotly_chart(fig_temp, use_container_width=True)
+            st.plotly_chart(fig_dev, use_container_width=True)
 
 
 # ─── Tab: Gatun Lake ──────────────────────────────────────────────────────────────
@@ -902,15 +1013,18 @@ _BRIEF_CSS = """
 
 
 def _compute_cdd_summary(regions: list) -> dict:
-    """Compute last-14-day CDD total vs 2000-2024 normal for the given regions.
+    """CDD deviation summary per region: current (last 14d) and 14-day forecast,
+    each vs the 2000-2024 normal AND the trailing 5-year average.
 
-    Uses load_current_year_cdd() for actual recent data (ERA5 + ECMWF forecast),
-    and the precomputed historical table for the normal baseline.
+    Returns {region: {current_14d, anomaly, anomaly_5yr,
+                      fcst_14d, fcst_anomaly, fcst_anomaly_5yr}} where
+    "anomaly*" = vs 2000-24 normal and "*_5yr" = vs trailing 5-year average.
+
+    The current deviation is the "already priced" read; the forecast deviation is
+    the forward-risk read the AI brief is asked to weight most heavily.
     """
     today = pd.Timestamp.today().normalize()
-    current_year = today.year
-    season_start = pd.Timestamp(f"{current_year}-04-15")
-    window_start = today - pd.Timedelta(days=14)
+    win = pd.Timedelta(days=14)
     summary = {}
 
     # Load all historical CDD once — filters per-region inside the loop
@@ -919,40 +1033,48 @@ def _compute_cdd_summary(regions: list) -> dict:
     except Exception:
         precomp_hist = pd.DataFrame()
 
+    def _clim_sum(clim_df, doys):
+        """Sum of day-of-year mean CDD over the given day-of-year values."""
+        if clim_df.empty or len(doys) == 0:
+            return 0.0
+        sub = clim_df[clim_df["day_of_year"].isin(list(doys))]
+        return float(sub["mean_cdd"].sum())
+
     for region in regions:
         try:
-            # ── Recent CDD: ERA5 actuals + ECMWF forecast gap-fill ───────────────
+            # ── Current-year CDD: ERA5 actuals + ECMWF-ENS forecast gap-fill ─────
             current_df = load_current_year_cdd(region)
             if current_df.empty:
                 continue
             current_df = current_df.copy()
             current_df["date"] = pd.to_datetime(current_df["date"])
-            recent = current_df[current_df["date"] >= window_start]
-            if recent.empty:
-                continue
-            current_14d = float(recent["cdd"].sum())
 
-            # ── Normal: cumulative difference from 2000-2024 climatology ─────────
-            normal_14d = 0.0
-            dos_end = max(1, (today - season_start).days)
-            dos_start = max(0, dos_end - 14)
-
-            if not precomp_hist.empty and "region" in precomp_hist.columns and dos_end > 0:
+            # ── Daily CDD climatologies: full normal + trailing 5-year ──────────
+            region_hist = pd.DataFrame(columns=["date", "cdd"])
+            if not precomp_hist.empty and "region" in precomp_hist.columns:
                 region_hist = precomp_hist[precomp_hist["region"] == region][["date", "cdd"]].copy()
-                if not region_hist.empty:
-                    normal_df = compute_normal(region_hist)
-                    if not normal_df.empty:
-                        # compute_normal returns CUMULATIVE mean; take the 14-day increment
-                        row_end   = normal_df.loc[normal_df["day_of_season"] == dos_end,   "mean"].values
-                        row_start = normal_df.loc[normal_df["day_of_season"] == dos_start, "mean"].values
-                        if len(row_end) and len(row_start):
-                            normal_14d = float(row_end[0]) - float(row_start[0])
-                        elif len(row_end):
-                            normal_14d = float(row_end[0])
+            clim_norm = compute_daily_cdd_climatology_v2(region_hist)
+            clim_5yr = compute_daily_cdd_five_year_avg(region_hist)
+
+            # Current window (last 14d up to today) — "already priced"
+            recent = current_df[(current_df["date"] > today - win) & (current_df["date"] <= today)]
+            # Forward window (next 14d) — "forward risk"
+            fwd = current_df[(current_df["date"] > today) & (current_df["date"] <= today + win)]
+            if recent.empty and fwd.empty:
+                continue
+
+            cur_sum = float(recent["cdd"].sum())
+            cur_doys = recent["date"].dt.day_of_year.values
+            fwd_sum = float(fwd["cdd"].sum())
+            fwd_doys = fwd["date"].dt.day_of_year.values
 
             summary[region] = {
-                "current_7d": round(current_14d, 1),
-                "anomaly":    round(current_14d - normal_14d, 1),
+                "current_14d":      round(cur_sum, 1),
+                "anomaly":          round(cur_sum - _clim_sum(clim_norm, cur_doys), 1),
+                "anomaly_5yr":      round(cur_sum - _clim_sum(clim_5yr, cur_doys), 1),
+                "fcst_14d":         round(fwd_sum, 1),
+                "fcst_anomaly":     round(fwd_sum - _clim_sum(clim_norm, fwd_doys), 1),
+                "fcst_anomaly_5yr": round(fwd_sum - _clim_sum(clim_5yr, fwd_doys), 1),
             }
         except Exception:
             continue
@@ -1012,14 +1134,24 @@ _AGENT_META = [
     ("hurricane",   "🌀 Hurricanes",   "Supply chain risk"),
     ("kaub",        "🌊 Rhine / Kaub",  "Inland transport"),
     ("cdd_eu",      "🌡 EU CDD",        "Gas-coal switching"),
-    ("cdd_asia",    "🌡 Asia CDD",      "Coal power demand"),
+    ("cdd_asia",    "🌡 China + Asia CDD", "Coal power demand"),
     ("china_hydro", "💧 China Hydro",   "Three Gorges"),
 ]
 
 
-def _render_market_indexes(kaub_cm, cdd_eu_summary, cdd_asia_summary):
-    """Pre-loaded KPI cards: Kaub level + EU CDD anomaly + Asia CDD anomaly."""
-    cards = []
+def _avg_field(summary: dict, key: str) -> float:
+    """Mean of `key` across a CDD summary dict (0.0 if empty)."""
+    vals = [d.get(key, 0.0) for d in summary.values()]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def _render_market_indexes(kaub_cm, cdd_eu_summary, cdd_china_summary, cdd_asia_summary):
+    """Pre-loaded KPI cards: Kaub level + EU / China / Asia CDD.
+
+    Each CDD card shows the current anomaly vs normal (headline) with a sub-line
+    giving the deviation vs the trailing 5-yr average and the 14-day forecast.
+    """
+    cards = []  # (label, value, colour, status, subline)
 
     # Kaub Rhine level
     if kaub_cm is not None:
@@ -1031,36 +1163,39 @@ def _render_market_indexes(kaub_cm, cdd_eu_summary, cdd_asia_summary):
             k_col, k_status = "#dc2626", "RESTRICTED"
         else:
             k_col, k_status = "#7f1d1d", "CRITICAL"
-        cards.append(("Rhine / Kaub", f"{kaub_cm:.0f} cm", k_col, k_status))
+        cards.append(("Rhine / Kaub", f"{kaub_cm:.0f} cm", k_col, k_status, "barge transport"))
     else:
-        cards.append(("Rhine / Kaub", "N/A", "#9ca3af", "unavailable"))
+        cards.append(("Rhine / Kaub", "N/A", "#9ca3af", "unavailable", ""))
 
-    # EU CDD anomaly (14-day sum across regions)
+    def _cdd_card(label, summary, thr):
+        cur = _avg_field(summary, "anomaly")
+        a5 = _avg_field(summary, "anomaly_5yr")
+        fc = _avg_field(summary, "fcst_anomaly")
+        col = "#dc2626" if cur > thr else ("#2563eb" if cur < -thr else "#6b7280")
+        status = "WARM" if cur > thr else ("COOL" if cur < -thr else "NEAR NORMAL")
+        sub = f"vs 5-yr {a5:+.1f} · fcst {fc:+.1f}"
+        return (label, f"{cur:+.1f} °C·d", col, status, sub)
+
     if cdd_eu_summary:
-        vals = [d.get("anomaly", 0.0) for d in cdd_eu_summary.values()]
-        avg = sum(vals) / len(vals)
-        eu_col = "#dc2626" if avg > 2 else ("#2563eb" if avg < -2 else "#6b7280")
-        eu_status = "WARM" if avg > 2 else ("COOL" if avg < -2 else "NEAR NORMAL")
-        cards.append(("EU CDD Anomaly", f"{avg:+.1f} °C·d", eu_col, eu_status))
-
-    # Asia CDD anomaly
+        cards.append(_cdd_card("EU CDD (vs normal)", cdd_eu_summary, 2.0))
+    if cdd_china_summary:
+        cards.append(_cdd_card("China CDD (vs normal)", cdd_china_summary, 3.0))
     if cdd_asia_summary:
-        vals = [d.get("anomaly", 0.0) for d in cdd_asia_summary.values()]
-        avg = sum(vals) / max(len(vals), 1)
-        as_col = "#dc2626" if avg > 3 else ("#2563eb" if avg < -3 else "#6b7280")
-        as_status = "WARM" if avg > 3 else ("COOL" if avg < -3 else "NEAR NORMAL")
-        cards.append(("Asia CDD Anomaly", f"{avg:+.1f} °C·d", as_col, as_status))
+        cards.append(_cdd_card("Asia CDD (vs normal)", cdd_asia_summary, 3.0))
 
     cols = st.columns(len(cards))
-    for i, (label, value, val_col, status) in enumerate(cards):
+    for i, (label, value, val_col, status, sub) in enumerate(cards):
+        sub_html = (f'<div style="font-size:0.62rem;color:#94a3b8;margin-top:3px">{sub}</div>'
+                    if sub else "")
         with cols[i]:
             st.markdown(
                 f'<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;'
-                f'padding:14px 16px;text-align:center;min-height:90px">'
-                f'<div style="font-size:0.68rem;color:#6b7280;font-weight:700;'
-                f'text-transform:uppercase;letter-spacing:0.05em;margin-bottom:5px">{label}</div>'
+                f'padding:14px 16px;text-align:center;min-height:104px">'
+                f'<div style="font-size:0.66rem;color:#6b7280;font-weight:700;'
+                f'text-transform:uppercase;letter-spacing:0.04em;margin-bottom:5px">{label}</div>'
                 f'<div style="font-size:1.3rem;font-weight:800;color:{val_col};margin-bottom:3px">{value}</div>'
                 f'<div style="font-size:0.7rem;color:{val_col};font-weight:700">{status}</div>'
+                f'{sub_html}'
                 f'</div>',
                 unsafe_allow_html=True,
             )
@@ -1129,16 +1264,20 @@ def render_coal_brief():
             _, kaub_cm_pre = _fetch_kaub_level_cached()
         except Exception:
             kaub_cm_pre = None
+        from _ai_coal_brief import EU_REGIONS, CHINA_REGIONS, ASIA_REGIONS
         try:
-            from _ai_coal_brief import EU_REGIONS, ASIA_REGIONS
             cdd_eu_pre = _compute_cdd_summary(EU_REGIONS)
         except Exception:
             cdd_eu_pre = {}
         try:
+            cdd_china_pre = _compute_cdd_summary(CHINA_REGIONS)
+        except Exception:
+            cdd_china_pre = {}
+        try:
             cdd_asia_pre = _compute_cdd_summary(ASIA_REGIONS)
         except Exception:
             cdd_asia_pre = {}
-    _render_market_indexes(kaub_cm_pre, cdd_eu_pre, cdd_asia_pre)
+    _render_market_indexes(kaub_cm_pre, cdd_eu_pre, cdd_china_pre, cdd_asia_pre)
 
     st.markdown("---")
 
@@ -1169,15 +1308,15 @@ def render_coal_brief():
 |---|---|
 | Hurricane | NHC + JTWC live storm data (already loaded by this app) |
 | Kaub | Live Rhine gauge from Pegelonline (German Federal Waterways) |
-| European CDD | Germany, France — Databricks ERA5 + ECMWF forecast |
-| Asia-Pacific CDD | China N/C/S, Japan, South Korea, India — Databricks ERA5 + ECMWF forecast |
+| European CDD | Germany, France — current & 14-day forecast vs normal **and** 5-yr avg |
+| China + Asia CDD | China N/C/S (own block) + Japan, S. Korea, India — vs normal **and** 5-yr avg |
 | China hydro | Three Gorges catchment precipitation from Databricks ERA5/ECMWF |
 | Synthesis | Combines all five findings into 5-6 coal trader bullets |
 """)
         return
 
     if generate:
-        from _ai_coal_brief import EU_REGIONS, ASIA_REGIONS
+        from _ai_coal_brief import EU_REGIONS, CHINA_REGIONS, ASIA_REGIONS
         progress = st.empty()
 
         def _prog(msg: str):
@@ -1192,6 +1331,13 @@ def render_coal_brief():
             cdd_eu = {}
             try:
                 cdd_eu = _compute_cdd_summary(EU_REGIONS)
+            except Exception:
+                pass
+
+            _prog("Computing China CDD anomalies…")
+            cdd_china = {}
+            try:
+                cdd_china = _compute_cdd_summary(CHINA_REGIONS)
             except Exception:
                 pass
 
@@ -1218,6 +1364,7 @@ def render_coal_brief():
                 three_gorges_clim=tg_clim,
                 cdd_eu=cdd_eu,
                 cdd_asia=cdd_asia,
+                cdd_china=cdd_china,
                 azure_tenant_id=tenant_id,
                 azure_client_id=client_id,
                 azure_client_secret=client_secret,

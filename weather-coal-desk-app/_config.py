@@ -10,15 +10,22 @@ SEASON_START_MONTH = 4
 SEASON_START_DAY = 15
 HIST_START_YEAR = 2000
 HIST_END_YEAR = 2024
+# Trailing window for the "past 5-year average" comparison (most recent 5 hist years)
+FIVE_YEAR_START = HIST_END_YEAR - 4   # 2020–2024 inclusive
 
 # Source tables — Temperature (sandbox, no prod dependency)
 TABLE_HIST = "dna_snbx_weather.coal_desk.temperature_actuals"
 TABLE_FCST = "dna_snbx_weather.coal_desk.temperature_forecast"
+# Extended-range gridded forecast (ECMWF-vareps, 44d) — populated by the refresh
+# pipeline. Used for the week 3-6 anomaly maps. Falls back to "No data" if absent.
+TABLE_FCST_VAREPS = "dna_snbx_weather.coal_desk.temperature_forecast_vareps"
 TEMP_CLIM = "dna_snbx_weather.coal_desk.temperature_climatology"
 CURVE_HIST = "t_mean_2m_24h_c_ecmwf_era5_p1d"
 CURVE_FCST = "t_mean_2m_24h_c_ecmwf_ens_p1d"
+CURVE_FCST_VAREPS = "t_mean_2m_24h_c_ecmwf_vareps_p1d"
 MODEL_HIST = "ecmwf-era5"
 MODEL_FCST = "ecmwf-ens"
+MODEL_FCST_VAREPS = "ecmwf-vareps"
 
 # Source tables — Precipitation (sandbox, no prod dependency)
 TABLE_PRECIP_HIST = "dna_snbx_weather.coal_desk.precipitation_actuals"

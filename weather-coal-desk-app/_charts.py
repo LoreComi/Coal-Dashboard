@@ -35,6 +35,7 @@ def make_cumulative_cdd_chart(
     all_historical_cumulative: dict = None,
     similar_years: list = None,
     ensemble_spread: pd.DataFrame = None,
+    five_year_avg: pd.DataFrame = None,
 ) -> go.Figure:
     """Build the cumulative CDD chart for one region.
 
@@ -45,6 +46,8 @@ def make_cumulative_cdd_chart(
         all_historical_cumulative: dict {year: cum_df} pre-computed for 2000-2024.
         similar_years: list of (year, score) tuples from compute_similar_years(),
                        sorted best-first.
+        five_year_avg: cumulative-CDD 5-year average (day_of_season, mean) drawn as
+                       a dashed green reference line alongside the long-run normal.
     """
     fig = go.Figure()
     prev_year = current_year - 1
@@ -93,6 +96,14 @@ def make_cumulative_cdd_chart(
             x=normal['day_of_season'], y=normal['mean'],
             mode='lines', line=dict(color='#9ca3af', dash='dash', width=1.5),
             name='Normal mean',
+        ))
+
+    # ── Trailing 5-year average ───────────────────────────────────────────────
+    if five_year_avg is not None and not five_year_avg.empty:
+        fig.add_trace(go.Scatter(
+            x=five_year_avg['day_of_season'], y=five_year_avg['mean'],
+            mode='lines', line=dict(color='#0d9488', dash='dashdot', width=1.6),
+            name='5-yr avg (2020–24)',
         ))
 
     # ── Previous year ─────────────────────────────────────────────────────────

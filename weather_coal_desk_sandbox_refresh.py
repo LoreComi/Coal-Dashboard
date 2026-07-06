@@ -3,9 +3,10 @@
 # MAGIC %md
 # MAGIC ## Refresh Sandbox Tables for Weather Coal Desk App
 # MAGIC
-# MAGIC Refreshes the 4 dynamic tables in `dna_snbx_weather.coal_desk` that mirror production data.
+# MAGIC Refreshes the dynamic tables in `dna_snbx_weather.coal_desk` that mirror production data.
 # MAGIC - `temperature_actuals` — Current-year ERA5 actuals
-# MAGIC - `temperature_forecast` — ECMWF-ENS temperature forecast
+# MAGIC - `temperature_forecast` — ECMWF-ENS temperature forecast (14d)
+# MAGIC - `temperature_forecast_vareps` — ECMWF-vareps temperature forecast (44d, extended maps)
 # MAGIC - `precipitation_actuals` — Current-year precip actuals
 # MAGIC - `precipitation_forecast` — ECMWF-ENS precip forecast
 # MAGIC
@@ -64,6 +65,24 @@ WHERE model = 'ecmwf-ens'
   AND {TEMP_FILTER}
 """)
 print("✓ temperature_forecast refreshed")
+
+# COMMAND ----------
+
+# DBTITLE 1,Refresh temperature_forecast_vareps (extended range, 44d)
+# ECMWF-vareps gridded 44-day forecast — powers the week 3-6 anomaly maps
+# (Temperature tab). Same spatial filter / grid as the ENS forecast so it reuses
+# the temperature_climatology table for anomalies. Kept in a SEPARATE table so the
+# 14-day ENS maps are untouched. If the vareps curve name differs in prod, adjust
+# the curve_name below (mirror of the ENS curve with ens -> vareps).
+spark.sql(f"""
+CREATE OR REPLACE TABLE dna_snbx_weather.coal_desk.temperature_forecast_vareps AS
+SELECT delivery_start, value, latitude, longitude
+FROM dna_prod_silver.meteomatics.temperature_forecast
+WHERE model = 'ecmwf-vareps'
+  AND curve_name = 't_mean_2m_24h_c_ecmwf_vareps_p1d'
+  AND {TEMP_FILTER}
+""")
+print("✓ temperature_forecast_vareps refreshed")
 
 # COMMAND ----------
 

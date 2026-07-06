@@ -16,7 +16,9 @@ import streamlit as st
 from _config import (
     CITY_LOCATIONS, POPULATION, REGION_MAP, CITY_TO_REGION,
     BASE_TEMP, SEASON_START_MONTH, SEASON_START_DAY, HIST_START_YEAR, HIST_END_YEAR,
-    TABLE_HIST, TABLE_FCST, TEMP_CLIM, CURVE_HIST, CURVE_FCST, MODEL_HIST, MODEL_FCST,
+    FIVE_YEAR_START,
+    TABLE_HIST, TABLE_FCST, TABLE_FCST_VAREPS, TEMP_CLIM,
+    CURVE_HIST, CURVE_FCST, MODEL_HIST, MODEL_FCST,
     TABLE_PRECIP_HIST, TABLE_PRECIP_FCST, PRECIP_CLIM, CURVE_PRECIP_HIST, CURVE_PRECIP_FCST,
     MODEL_PRECIP_CLIM, CURVE_PRECIP_CLIM,
 )
@@ -250,9 +252,16 @@ def load_gridded_precip_deviation(map_region: str, start_date, end_date) -> pd.D
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def load_gridded_anomalies_multiday(map_region: str, start_date, end_date) -> pd.DataFrame:
+def load_gridded_anomalies_multiday(map_region: str, start_date, end_date,
+                                    source_table: str = TABLE_FCST) -> pd.DataFrame:
     """Load gridded forecast + climatology for a date range, at 1-deg resolution.
-    Returns DataFrame with lat, lon, anomaly (averaged over the period)."""
+
+    Returns DataFrame with lat, lon, anomaly (averaged over the period).
+
+    source_table selects the forecast source: TABLE_FCST (ECMWF-ENS, ~14d) for the
+    near-term maps, or TABLE_FCST_VAREPS (ECMWF-vareps, ~44d) for the week 3-6
+    extended-range maps. Returns an empty frame if the table/range has no data.
+    """
     bounds = MAP_REGIONS[map_region]
     start_str = str(start_date)
     end_str = str(end_date)
@@ -260,7 +269,7 @@ def load_gridded_anomalies_multiday(map_region: str, start_date, end_date) -> pd
     # Average forecast over the period
     fcst_q = f"""
     SELECT AVG(value) as temperature, latitude, longitude
-    FROM {TABLE_FCST}
+    FROM {source_table}
     WHERE CAST(delivery_start AS DATE) BETWEEN '{start_str}' AND '{end_str}'
       AND latitude BETWEEN {bounds['lat_min']} AND {bounds['lat_max']}
       AND longitude BETWEEN {bounds['lon_min']} AND {bounds['lon_max']}
@@ -671,9 +680,16 @@ def compute_cumulative(cdd_df: pd.DataFrame, year: int) -> pd.DataFrame:
     return s[['date', 'day_of_season', 'cumulative_cdd']]
 
 
-def compute_normal(cdd_df: pd.DataFrame) -> pd.DataFrame:
+def compute_normal(cdd_df: pd.DataFrame,
+                   start_year: int = HIST_START_YEAR,
+                   end_year: int = HIST_END_YEAR) -> pd.DataFrame:
+    """Cumulative-CDD climatology (mean ± 1σ per day-of-season) over [start_year, end_year].
+
+    Defaults to the full 2000–2024 record ("normal"); pass FIVE_YEAR_START to get the
+    trailing 5-year average.
+    """
     curves = []
-    for yr in range(HIST_START_YEAR, HIST_END_YEAR + 1):
+    for yr in range(start_year, end_year + 1):
         c = compute_cumulative(cdd_df, yr)
         if not c.empty:
             c['year'] = yr
@@ -682,9 +698,15 @@ def compute_normal(cdd_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=['day_of_season', 'mean', 'std', 'upper', 'lower'])
     combined = pd.concat(curves, ignore_index=True)
     stats = combined.groupby('day_of_season')['cumulative_cdd'].agg(['mean', 'std']).reset_index()
+    stats['std'] = stats['std'].fillna(0)
     stats['upper'] = stats['mean'] + stats['std']
     stats['lower'] = (stats['mean'] - stats['std']).clip(lower=0)
     return stats
+
+
+def compute_five_year_avg(cdd_df: pd.DataFrame) -> pd.DataFrame:
+    """Trailing 5-year cumulative-CDD average per day-of-season (FIVE_YEAR_START–HIST_END_YEAR)."""
+    return compute_normal(cdd_df, start_year=FIVE_YEAR_START, end_year=HIST_END_YEAR)
 
 
 def load_all_historical_cumulative(historical_cdd: pd.DataFrame) -> dict:
@@ -697,18 +719,29 @@ def load_all_historical_cumulative(historical_cdd: pd.DataFrame) -> dict:
     return result
 
 
-def compute_daily_cdd_climatology_v2(hist_df: pd.DataFrame) -> pd.DataFrame:
-    """Day-of-year mean and std of daily CDD from pre-aggregated historical data (2000–2024)."""
+def compute_daily_cdd_climatology_v2(hist_df: pd.DataFrame,
+                                     start_year: int = HIST_START_YEAR,
+                                     end_year: int = HIST_END_YEAR) -> pd.DataFrame:
+    """Day-of-year mean and std of daily CDD from pre-aggregated historical data.
+
+    Defaults to the full 2000–2024 record; pass FIVE_YEAR_START for the trailing
+    5-year daily average (used for the "vs past 5-year average" forecast comparison).
+    """
     if hist_df.empty or 'cdd' not in hist_df.columns:
         return pd.DataFrame(columns=['day_of_year', 'mean_cdd', 'std_cdd'])
     df = hist_df[['date', 'cdd']].copy()
     df['day_of_year'] = pd.to_datetime(df['date']).dt.day_of_year
     df['year'] = pd.to_datetime(df['date']).dt.year
-    df = df[df['year'].between(HIST_START_YEAR, HIST_END_YEAR)]
+    df = df[df['year'].between(start_year, end_year)]
     stats = df.groupby('day_of_year')['cdd'].agg(['mean', 'std']).reset_index()
     stats.columns = ['day_of_year', 'mean_cdd', 'std_cdd']
     stats['std_cdd'] = stats['std_cdd'].fillna(0)
     return stats
+
+
+def compute_daily_cdd_five_year_avg(hist_df: pd.DataFrame) -> pd.DataFrame:
+    """Day-of-year mean daily CDD over the trailing 5 years (FIVE_YEAR_START–HIST_END_YEAR)."""
+    return compute_daily_cdd_climatology_v2(hist_df, start_year=FIVE_YEAR_START, end_year=HIST_END_YEAR)
 
 
 def compute_temperature_climatology_simple(hist_df: pd.DataFrame) -> pd.DataFrame:

@@ -26,8 +26,9 @@ import pandas as pd
 
 # ── Region lists (match _config.REGION_MAP keys) ─────────────────────────────
 
-EU_REGIONS   = ['Germany', 'France']
-ASIA_REGIONS = ['China North', 'China Central', 'China South', 'Japan', 'South Korea', 'India']
+EU_REGIONS    = ['Germany', 'France']
+CHINA_REGIONS = ['China North', 'China Central', 'China South']
+ASIA_REGIONS  = ['Japan', 'South Korea', 'India']   # Asia-Pacific ex-China
 
 
 # ── Kaub navigation thresholds (cm above chart datum) ────────────────────────
@@ -111,16 +112,25 @@ In winter: cold anomaly → more heating demand → more gas burn → bullish TT
 
 Regions: Germany, France. Context: Benelux, UK, Iberia, Italy (not always in data).
 
+The data gives, per region, the CURRENT deviation (vs 2000-24 normal AND vs the
+trailing 5-year average) and the 14-day FORECAST deviation (vs both baselines).
+  - The trailing 5-year average captures the recent climate regime; a signal that is
+    positive vs the long-run normal BUT near the 5-year average is less surprising.
+  - The current deviation is largely priced in. LEAD your read with the FORECAST
+    deviation — that is what re-prices forward gas/coal risk.
+
 Write 1-2 bullet points on:
-  - Dominant temperature / CDD signal this week and next 1-2 weeks
+  - The forward CDD signal (next 2 weeks) framed against where we are now, and how it
+    compares to both normal and the 5-year average
   - Whether it drives TTF / gas demand higher or lower
   - Coal switching implication: is coal gaining or losing to gas?
 
-Format: each bullet starts with "- ". Quote specific countries and CDD magnitudes.
+Format: each bullet starts with "- ". Quote specific countries and CDD magnitudes,
+and say "vs normal" / "vs 5-yr avg" explicitly.
 
 Last line only — write exactly one of:
-SIGNAL: BULLISH  (heat raising European gas demand or supporting coal-gas switching toward coal)
-SIGNAL: BEARISH  (cool / below-normal temperatures reducing energy demand)
+SIGNAL: BULLISH  (forecast heat raising European gas demand or supporting coal-gas switching toward coal)
+SIGNAL: BEARISH  (cool / below-normal forecast reducing energy demand)
 SIGNAL: NEUTRAL  (temperature signal mixed or marginal for coal)
 """
 
@@ -134,16 +144,26 @@ High CDD in China (esp. North, Central) → air-conditioning load up → coal po
 High CDD in Japan/South Korea → similar dynamic (LNG + coal-fired power).
 High CDD in India → more coal-fired power → bullish Indian imports (Indonesian HBA).
 
-Write 1-2 bullet points on:
-  - The dominant temperature / CDD signal across China, Japan, South Korea, India
-  - Direct coal demand implication (power burn), NOT gas switching (Asia burns coal directly)
-  - Bullish or bearish for Newcastle index and Indonesian HBA
+You receive TWO blocks: (1) CHINA (North/Central/South) and (2) ASIA ex-China
+(Japan/Korea/India). Each block gives, per region, the CURRENT deviation (vs 2000-24
+normal AND vs the trailing 5-year average) and the 14-day FORECAST deviation (vs both).
+  - The 5-year average is the recent-regime baseline; heat that is high vs normal but
+    ordinary vs the last 5 years is a weaker surprise.
+  - The current deviation is largely priced. LEAD with the FORECAST deviation — it is
+    what re-prices forward coal-burn risk.
 
-Format: each bullet starts with "- ". Separate China from Japan/Korea/India where signals differ.
+Write 2-3 bullet points:
+  - Treat CHINA separately from Japan/Korea/India — give China its own bullet.
+  - For each, frame the forward CDD signal vs both normal and the 5-year average.
+  - Direct coal demand implication (power burn), NOT gas switching (Asia burns coal directly).
+  - Bullish or bearish for Newcastle index and Indonesian HBA.
+
+Format: each bullet starts with "- ". Quote CDD magnitudes and say
+"vs normal" / "vs 5-yr avg" explicitly.
 
 Last line only — write exactly one of:
-SIGNAL: BULLISH  (above-normal heat driving coal power demand — bullish Newcastle / HBA)
-SIGNAL: BEARISH  (below-normal temperatures reducing coal power burn)
+SIGNAL: BULLISH  (above-normal forecast heat driving coal power demand — bullish Newcastle / HBA)
+SIGNAL: BEARISH  (below-normal forecast reducing coal power burn)
 SIGNAL: NEUTRAL  (temperature signal mild or offsetting across regions)
 """
 
@@ -274,9 +294,14 @@ def _fmt_kaub(measurements: list, current_cm: float | None) -> str:
 
 
 def _fmt_cdd(cdd_summary: dict, label: str = "") -> str:
-    """cdd_summary: {region: {"anomaly": float, "current_7d": float}}"""
+    """Format a CDD block: current deviation (vs normal & vs 5-yr avg) + 14-day forecast.
+
+    cdd_summary: {region: {"current_14d", "anomaly", "anomaly_5yr",
+                           "fcst_14d", "fcst_anomaly", "fcst_anomaly_5yr"}}
+    where "anomaly*" = vs 2000-2024 normal and "*_5yr" = vs trailing 5-year average.
+    """
     ts = datetime.utcnow().strftime("%d %b %Y")
-    header = f"{'(' + label + ') ' if label else ''}CDD anomalies — last 14 days vs 2000-2024 normal — {ts}"
+    header = f"{'(' + label + ') ' if label else ''}CDD — current vs 2000-24 normal & trailing 5-yr avg, plus 14-day forecast — {ts}"
 
     if not cdd_summary:
         month = datetime.utcnow().month
@@ -285,12 +310,24 @@ def _fmt_cdd(cdd_summary: dict, label: str = "") -> str:
                "Winter — heating season, CDD minimal")
         return f"{header}\nNo detailed CDD data available. Seasonal context: {ctx}"
 
-    lines = [header, f"{'Region':<22} {'14d CDD':>10} {'Anomaly':>10}  Direction"]
+    lines = [
+        header,
+        "Read the CURRENT deviation as largely priced-in; the FORECAST deviation is what",
+        "re-prices forward risk — weight the forward signal most heavily.",
+        "",
+        f"{'Region':<20}{'CurCDD':>8}{'vsNorm':>8}{'vs5yr':>8}   {'FcstCDD':>8}{'FcNorm':>8}{'Fc5yr':>8}",
+    ]
     for region, d in sorted(cdd_summary.items()):
-        anom = d.get("anomaly", 0.0)
-        curr = d.get("current_7d", 0.0)
-        direction = "warmer than normal" if anom > 0.5 else ("colder than normal" if anom < -0.5 else "near normal")
-        lines.append(f"  {region:<22} {curr:>10.1f} {anom:>+10.1f}  {direction}")
+        cur   = d.get("current_14d", d.get("current_7d", 0.0))
+        anom  = d.get("anomaly", 0.0)
+        a5    = d.get("anomaly_5yr", 0.0)
+        fcst  = d.get("fcst_14d", 0.0)
+        fanom = d.get("fcst_anomaly", 0.0)
+        f5    = d.get("fcst_anomaly_5yr", 0.0)
+        lines.append(
+            f"  {region:<18}{cur:>8.1f}{anom:>+8.1f}{a5:>+8.1f}   "
+            f"{fcst:>8.1f}{fanom:>+8.1f}{f5:>+8.1f}"
+        )
     return "\n".join(lines)
 
 
@@ -459,6 +496,7 @@ def generate_coal_brief(
     azure_tenant_id: str,
     azure_client_id: str,
     azure_client_secret: str,
+    cdd_china: dict | None = None,
     model: str = "gpt-4o",
     progress_cb=None,
 ) -> dict:
@@ -470,8 +508,11 @@ def generate_coal_brief(
     three_gorges_hist    hist_df from load_watershed_precip("Three Gorges")
     three_gorges_fcst    fcst_df from load_watershed_precip("Three Gorges")
     three_gorges_clim    clim_df from load_watershed_precip("Three Gorges")
-    cdd_eu               {region: {"anomaly": float, "current_7d": float}} for European regions
-    cdd_asia             {region: {"anomaly": float, "current_7d": float}} for Asian regions
+    cdd_eu               {region: {current_14d, anomaly, anomaly_5yr, fcst_14d,
+                         fcst_anomaly, fcst_anomaly_5yr}} for European regions
+    cdd_asia             same shape, Asia ex-China (Japan / South Korea / India)
+    cdd_china            same shape, China (North / Central / South); shown to the
+                         Asia agent as its own block. Defaults to {} if omitted.
     azure_*              service-principal credentials for Azure OpenAI
     model                Azure OpenAI deployment name (default "gpt-4o")
     progress_cb          optional callable(str) for Streamlit progress messages
@@ -494,8 +535,12 @@ def generate_coal_brief(
     # ── Step 2: format context documents ─────────────────────────────────────
     doc_hurricane  = _fmt_hurricanes(storms)
     doc_kaub       = _fmt_kaub(kaub_measurements, kaub_level)
-    doc_cdd_eu     = _fmt_cdd(cdd_eu,   "Europe")
-    doc_cdd_asia   = _fmt_cdd(cdd_asia, "Asia-Pacific")
+    doc_cdd_eu     = _fmt_cdd(cdd_eu, "Europe")
+    # Asia agent sees China and rest-of-Asia as two clearly separated blocks.
+    doc_cdd_asia   = (
+        _fmt_cdd(cdd_china or {}, "China") + "\n\n" +
+        _fmt_cdd(cdd_asia, "Asia ex-China (Japan / South Korea / India)")
+    )
     doc_hydro      = _fmt_china_hydro(three_gorges_hist, three_gorges_fcst, three_gorges_clim)
 
     # ── Step 3: specialist agents (independent, sequential) ───────────────────
