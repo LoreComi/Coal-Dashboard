@@ -17,7 +17,7 @@ from _config import (
     REGION_MAP, CITY_LOCATIONS, POPULATION, CITY_TO_REGION,
     BASE_TEMP, DEFAULT_REGIONS,
 )
-from _config import TABLE_FCST_VAREPS
+from _config import TABLE_FCST, TABLE_FCST_VAREPS
 from _data_v2 import (
     load_historical, load_forecast, load_city_timeseries, load_anomalies,
     compute_region_cdd, compute_cumulative, compute_normal, compute_five_year_avg,

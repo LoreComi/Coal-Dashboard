@@ -68,21 +68,31 @@ print("✓ temperature_forecast refreshed")
 
 # COMMAND ----------
 
-# DBTITLE 1,Refresh temperature_forecast_vareps (extended range, 44d)
-# ECMWF-vareps gridded 44-day forecast — powers the week 3-6 anomaly maps
-# (Temperature tab). Same spatial filter / grid as the ENS forecast so it reuses
-# the temperature_climatology table for anomalies. Kept in a SEPARATE table so the
-# 14-day ENS maps are untouched. If the vareps curve name differs in prod, adjust
-# the curve_name below (mirror of the ENS curve with ens -> vareps).
-spark.sql(f"""
-CREATE OR REPLACE TABLE dna_snbx_weather.coal_desk.temperature_forecast_vareps AS
-SELECT delivery_start, value, latitude, longitude
-FROM dna_prod_silver.meteomatics.temperature_forecast
-WHERE model = 'ecmwf-vareps'
-  AND curve_name = 't_mean_2m_24h_c_ecmwf_vareps_p1d'
-  AND {TEMP_FILTER}
-""")
-print("✓ temperature_forecast_vareps refreshed")
+# DBTITLE 1,Refresh temperature_forecast_vareps (skip if production has no vareps)
+# ECMWF-vareps gridded 44-day forecast — powers the week 3-6 anomaly maps.
+# NOTE: The production silver table (dna_prod_silver.meteomatics.temperature_forecast)
+# does NOT contain the ecmwf-vareps model. This table is populated DIRECTLY from the
+# DSL API by the ingestion notebook (weather_coal_desk_ingestion, gridded vareps cell).
+# We only refresh from production if data actually exists there; otherwise we preserve
+# whatever the ingestion already wrote.
+
+_vareps_count = spark.sql("""
+    SELECT COUNT(*) as c FROM dna_prod_silver.meteomatics.temperature_forecast
+    WHERE model = 'ecmwf-vareps' AND curve_name = 't_mean_2m_24h_c_ecmwf_vareps_p1d'
+""").collect()[0]['c']
+
+if _vareps_count > 0:
+    spark.sql(f"""
+    CREATE OR REPLACE TABLE dna_snbx_weather.coal_desk.temperature_forecast_vareps AS
+    SELECT delivery_start, value, latitude, longitude
+    FROM dna_prod_silver.meteomatics.temperature_forecast
+    WHERE model = 'ecmwf-vareps'
+      AND curve_name = 't_mean_2m_24h_c_ecmwf_vareps_p1d'
+      AND {TEMP_FILTER}
+    """)
+    print("✓ temperature_forecast_vareps refreshed from production")
+else:
+    print("⏭ temperature_forecast_vareps: no vareps in production silver — preserving existing data from ingestion")
 
 # COMMAND ----------
 
