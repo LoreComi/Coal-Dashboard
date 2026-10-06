@@ -255,7 +255,7 @@ def make_forecast_temperature_chart(region: str, fcst_temp: pd.DataFrame, clim_t
                 mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip',
             ))
             fig.add_trace(go.Scatter(
-                x=cband['date'], y=(cband['mean_temp'] - cband['std_temp']).clip(lower=0),
+                x=cband['date'], y=cband['mean_temp'] - cband['std_temp'],
                 mode='lines', line=dict(width=0),
                 fill='tonexty', fillcolor='rgba(107,114,128,0.15)',
                 name='Clim ±1σ',
@@ -285,7 +285,7 @@ def make_forecast_temperature_chart(region: str, fcst_temp: pd.DataFrame, clim_t
             ))
 
     fig.add_hline(y=BASE_TEMP, line_dash='dot', line_color='#16a34a',
-                  annotation_text=f"CDD base ({BASE_TEMP}°C)",
+                  annotation_text=f"{region_mode(region).upper()} base ({BASE_TEMP}°C)",
                   annotation_font_color='#16a34a')
 
     fig.update_layout(
@@ -300,7 +300,8 @@ def make_forecast_temperature_chart(region: str, fcst_temp: pd.DataFrame, clim_t
 
 
 def make_forecast_cdd_deviation_chart(region: str, fcst_cdd: pd.DataFrame, clim_cdd: pd.DataFrame) -> go.Figure:
-    """Daily CDD deviation from normal (forecast − climatology). Handles multi-model data."""
+    """Daily degree-day (CDD or HDD per region_mode) deviation from normal (forecast − climatology).
+    Handles multi-model data."""
     fig = go.Figure()
 
     if not fcst_cdd.empty and not clim_cdd.empty:
@@ -335,12 +336,12 @@ def make_forecast_cdd_deviation_chart(region: str, fcst_cdd: pd.DataFrame, clim_
             ))
     elif not fcst_cdd.empty:
         src = fcst_cdd[fcst_cdd['model'] == 'ecmwf-ens'] if 'model' in fcst_cdd.columns else fcst_cdd
-        fig.add_trace(go.Bar(x=src['date'], y=src['cdd'], name='CDD', marker_color='#ea580c'))
+        fig.add_trace(go.Bar(x=src['date'], y=src['cdd'], name=region_mode(region).upper(), marker_color='#ea580c'))
 
     fig.add_hline(y=0, line_color='#94a3b8', line_width=1)
 
     fig.update_layout(
-        title=dict(text=f"CDD Anomaly vs Normal — {region}", font=dict(size=13, color='#0f172a')),
+        title=dict(text=f"{region_mode(region).upper()} Anomaly vs Normal — {region}", font=dict(size=13, color='#0f172a')),
         xaxis_title=None, yaxis_title="°C·d deviation",
         height=250, barmode='overlay',
         margin=dict(l=50, r=120, t=40, b=35),

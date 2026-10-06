@@ -23,7 +23,7 @@ from _data_v2 import (
     load_historical, load_forecast, load_city_timeseries, load_anomalies,
     compute_region_cdd, compute_cumulative, compute_normal, compute_five_year_avg,
     load_precomputed_cdd, load_precomputed_historical, load_precomputed_forecasts,
-    load_current_year_cdd, load_historical_hdd, load_gridded_anomalies, load_gridded_anomalies_multiday,
+    load_current_year_cdd, as_degree_days, load_gridded_anomalies, load_gridded_anomalies_multiday,
     load_gridded_precip_deviation, MAP_REGIONS,
     load_all_historical_cumulative, compute_similar_years,
     load_watershed_precip, load_gatun_lake_levels, load_hurricane_data,
@@ -73,19 +73,12 @@ def render_cdd_dashboard():
         return
 
     summary_rows = []
-    hdd_regions = tuple(sorted(r for r in selected if region_mode(r) == 'hdd'))
 
     # ── Historical CDD (2000-2024): one query for all regions ─────────────────
     try:
         precomp_hist = load_precomputed_historical()
     except Exception:
         precomp_hist = pd.DataFrame()
-
-    # ── HDD-mode regions: historical HDD built per city (not in the precomputed table) ─
-    try:
-        hist_hdd = load_historical_hdd(hdd_regions) if hdd_regions else pd.DataFrame()
-    except Exception:
-        hist_hdd = pd.DataFrame()
 
     # ── Current year: ERA5 actuals + ENS forecast, all regions in two queries ─
     try:
@@ -106,15 +99,13 @@ def render_cdd_dashboard():
             mode = region_mode(region).upper()
             season_year = current_season_year(region)
             # Historical degree days (2000-2024) for normal / prev season / similar years
-            if mode == 'HDD':
-                if hist_hdd.empty or region not in hist_hdd['region'].values:
-                    raise RuntimeError("Historical HDD unavailable")
-                region_cdd = hist_hdd[hist_hdd['region'] == region][['date', 'cdd']].sort_values('date').reset_index(drop=True)
-            elif not precomp_hist.empty and region in precomp_hist['region'].values:
-                region_cdd = precomp_hist[precomp_hist['region'] == region][['date', 'cdd']].sort_values('date').reset_index(drop=True)
+            if not precomp_hist.empty and region in precomp_hist['region'].values:
+                hist_df = precomp_hist[precomp_hist['region'] == region]
             else:
                 hist_df = load_historical(region)
-                region_cdd = compute_region_cdd(hist_df, region) if not hist_df.empty else pd.DataFrame(columns=['date', 'cdd'])
+            hist_df = as_degree_days(hist_df, region)   # HDD from region temperature in HDD mode
+            region_cdd = (hist_df[['date', 'cdd']].sort_values('date').reset_index(drop=True)
+                          if not hist_df.empty else pd.DataFrame(columns=['date', 'cdd']))
 
             # Current year: use bulk result (ERA5 actuals + ENS gap-fill), fallback per-region
             if not current_year_bulk.empty and region in current_year_bulk['region'].values:
@@ -682,10 +673,11 @@ def render_anomaly_map():
 _FCST_MODEL_LABELS = {'ecmwf-ens': 'ENS (14d)', 'ecmwf-vareps': 'vareps (44d)'}
 
 def render_cdd_forecast():
-    st.markdown("#### CDD FORECAST")
+    st.markdown("#### CDD / HDD FORECAST")
     st.caption(
         "ECMWF-ENS (14d) · ECMWF-vareps (44d) vs ERA5 climatology 2000–2024. "
-        "Bars = daily CDD anomaly vs normal · **Red/orange = warmer** · **Blue/purple = cooler**."
+        "Regions with a clear seasonality show **HDD from 1 Oct** and **CDD from 1 May**. "
+        "Bars = daily degree-day anomaly vs normal · **Red/orange = more CDD / HDD** · **Blue/purple = fewer**."
     )
 
     selected = st.multiselect(
@@ -704,8 +696,10 @@ def render_cdd_forecast():
     # ── First pass: build each region's charts + per-model summary rows ────────
     for region in selected:
         try:
-            hist_df = load_historical(region)
-            fcst_df = load_forecast(region)
+            mode = region_mode(region).upper()
+            # HDD-mode regions: 'cdd' columns are rebuilt as HDD from region temperature
+            hist_df = as_degree_days(load_historical(region), region)
+            fcst_df = as_degree_days(load_forecast(region), region)
 
             if fcst_df.empty:
                 figs.append((region, "No forecast data."))
@@ -746,11 +740,12 @@ def render_cdd_forecast():
                     total_5yr = float(merged['mean_cdd_5yr'].fillna(0).sum())
                     row = {
                         'Region': region,
+                        'Type': mode,
                         'Model': _FCST_MODEL_LABELS.get(model, model),
-                        'Fcst CDD': total_fcst,
-                        'Normal CDD': total_normal,
+                        'Fcst DD': total_fcst,
+                        'Normal DD': total_normal,
                         'Dev vs Normal': total_fcst - total_normal,
-                        '5yr Avg CDD': total_5yr,
+                        '5yr Avg DD': total_5yr,
                         'Dev vs 5yr': total_fcst - total_5yr,
                         'Days': len(merged),
                     }
@@ -778,16 +773,17 @@ def render_cdd_forecast():
             kpi_cols = st.columns(min(len(kpi_source), 6))
             for i, row in enumerate(kpi_source[:6]):
                 dev = row['Dev vs Normal']
-                cls = "kpi-card-warm" if dev > 0 else "kpi-card-cool"
+                # More CDD = warmer, more HDD = colder
+                cls = "kpi-card-warm" if (dev > 0) == (row['Type'] == 'CDD') else "kpi-card-cool"
                 with kpi_cols[i]:
-                    st.markdown(kpi_card(row['Region'], dev, "°C·d vs normal", card_class=cls), unsafe_allow_html=True)
+                    st.markdown(kpi_card(f"{row['Region']} ({row['Type']})", dev, "°C·d vs normal", card_class=cls), unsafe_allow_html=True)
 
         disp = pd.DataFrame(all_rows)
-        for col, fmt in [('Fcst CDD', '{:.0f}'), ('Normal CDD', '{:.0f}'), ('5yr Avg CDD', '{:.0f}'),
+        for col, fmt in [('Fcst DD', '{:.0f}'), ('Normal DD', '{:.0f}'), ('5yr Avg DD', '{:.0f}'),
                          ('Dev vs Normal', '{:+.0f}'), ('Dev vs 5yr', '{:+.0f}')]:
             disp[col] = disp[col].map(lambda v, f=fmt: f.format(v))
-        disp = disp[['Region', 'Model', 'Fcst CDD', 'Normal CDD', 'Dev vs Normal',
-                     '5yr Avg CDD', 'Dev vs 5yr', 'Days']]
+        disp = disp[['Region', 'Type', 'Model', 'Fcst DD', 'Normal DD', 'Dev vs Normal',
+                     '5yr Avg DD', 'Dev vs 5yr', 'Days']]
         st.dataframe(disp, use_container_width=True, hide_index=True)
         st.markdown("---")
 

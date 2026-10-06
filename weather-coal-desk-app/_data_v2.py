@@ -476,14 +476,13 @@ def load_current_year_cdd_bulk(regions: tuple) -> pd.DataFrame:
         rd = combined[combined['region'] == r].copy()
         if rd.empty:
             continue
-        rd['cdd_city'] = _degree_days(rd['temperature'], region_mode(r))
-        pivot = rd.pivot_table(index='date', columns='city', values='cdd_city', aggfunc='mean')
+        pivot = rd.pivot_table(index='date', columns='city', values='temperature', aggfunc='mean')
         avail = [c for c in cities if c in pivot.columns]
         if not avail:
             continue
         w = np.array([POPULATION[c] for c in avail], dtype=float)
         w = w / w.sum()
-        weighted = (pivot[avail].values * w[None, :]).sum(axis=1)
+        weighted = _weighted_degree_days(pivot[avail].values, w, region_mode(r))
         start = season_bounds(r, current_season_year(r))[0]
         region_df = pd.DataFrame({'date': pivot.index, 'cdd': weighted, 'region': r})
         region_results.append(region_df[region_df['date'] >= start])
@@ -553,21 +552,25 @@ def load_current_year_cdd(region: str, mode: str | None = None) -> pd.DataFrame:
     combined = combined.sort_values(['date', 'city']).drop_duplicates(
         subset=['date', 'city'], keep='first'
     )
-    combined['cdd_city'] = _degree_days(combined['temperature'], mode)
-    pivot = combined.pivot_table(index='date', columns='city', values='cdd_city', aggfunc='mean')
+    pivot = combined.pivot_table(index='date', columns='city', values='temperature', aggfunc='mean')
     available = [c for c in cities if c in pivot.columns]
     if not available:
         return pd.DataFrame(columns=['date', 'cdd'])
 
     pops = np.array([POPULATION[c] for c in available], dtype=float)
     weights = pops / pops.sum()
-    weighted = (pivot[available].values * weights[None, :]).sum(axis=1)
+    weighted = _weighted_degree_days(pivot[available].values, weights, mode)
     return pd.DataFrame({'date': pivot.index, 'cdd': weighted}).sort_values('date').reset_index(drop=True)
 
 
 # ─── Degree-day helpers ─────────────────────────────────────────────────────────
 # NOTE: the generic degree-day column is still called 'cdd' / 'cumulative_cdd' throughout
 # this pipeline; for regions in HDD mode it holds heating degree days.
+#
+# CDD is computed per city then population-weighted (as in the precomputed tables).
+# HDD is computed from the population-weighted region temperature, because the 2000-2024
+# history only exists at region level (coal_desk_cdd_historical); using the same method
+# for history, current season and forecast keeps the anomalies consistent.
 
 def _degree_days(temperature, mode: str):
     """Daily degree days from mean temperature: CDD = T - base, HDD = base - T (floored at 0)."""
@@ -575,41 +578,24 @@ def _degree_days(temperature, mode: str):
     return diff.clip(lower=0)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_historical_hdd(regions: tuple) -> pd.DataFrame:
-    """Population-weighted daily HDD per region from ERA5 city temperatures (2000 -> today).
+def _weighted_degree_days(temps: np.ndarray, weights: np.ndarray, mode: str) -> np.ndarray:
+    """Region degree days from city temperatures (last axis = cities) and normalised weights."""
+    if mode == 'hdd':
+        return np.maximum(BASE_TEMP - (temps * weights).sum(axis=-1), 0)
+    return (np.maximum(temps - BASE_TEMP, 0) * weights).sum(axis=-1)
 
-    Computed per city before weighting (as the CDD tables are) so the HDD normal is
-    consistent with the current-season HDD. Returns columns: date, region, cdd (= HDD).
-    """
-    rows = []
-    for r in regions:
-        cities = REGION_MAP.get(r, [])
-        total = sum(POPULATION[c] for c in cities)
-        for c in cities:
-            loc = CITY_LOCATIONS[c]
-            rows.append(f"({loc['latitude']}, {loc['longitude']}, '{r}', {POPULATION[c] / total})")
-    if not rows:
-        return pd.DataFrame(columns=['date', 'region', 'cdd'])
 
-    query = f"""
-    WITH w AS (
-        SELECT * FROM VALUES {", ".join(rows)} AS w(latitude, longitude, region, weight)
-    )
-    SELECT CAST(h.delivery_start AS DATE) AS date, w.region,
-           SUM(GREATEST({BASE_TEMP} - h.value, 0) * w.weight) AS cdd
-    FROM {TABLE_HIST} h
-    JOIN w ON h.latitude = w.latitude AND h.longitude = w.longitude
-    WHERE h.delivery_start >= '{HIST_START_YEAR}-01-01'
-    GROUP BY CAST(h.delivery_start AS DATE), w.region
-    ORDER BY date
+def as_degree_days(df: pd.DataFrame, region: str) -> pd.DataFrame:
+    """Frame whose 'cdd' column holds the region's current-mode degree days.
+
+    CDD-mode regions are returned unchanged; for HDD-mode regions 'cdd' is rebuilt as HDD
+    from the region-level 'temperature' column (works for the historical and forecast tables).
     """
-    df = run_query(query)
-    if df.empty:
-        return pd.DataFrame(columns=['date', 'region', 'cdd'])
-    df['date'] = pd.to_datetime(df['date'])
-    df['cdd'] = df['cdd'].astype(float)
-    return df
+    if df.empty or region_mode(region) == 'cdd':
+        return df
+    out = df.copy()
+    out['cdd'] = _degree_days(out['temperature'], 'hdd')
+    return out
 
 
 # ─── CDD computation ────────────────────────────────────────────────────────────
@@ -692,8 +678,8 @@ def compute_ensemble_spread(spread_bulk_df: pd.DataFrame, region: str, cum_curre
             continue
         w = np.array([POPULATION[c] for c in avail], dtype=float)
         w = w / w.sum()
-        dd_p25 = (_degree_days(grp.loc[avail, 'temp_p25'], mode).values * w).sum()
-        dd_p75 = (_degree_days(grp.loc[avail, 'temp_p75'], mode).values * w).sum()
+        dd_p25 = _weighted_degree_days(grp.loc[avail, 'temp_p25'].values, w, mode)
+        dd_p75 = _weighted_degree_days(grp.loc[avail, 'temp_p75'].values, w, mode)
         # Cold ensemble members give fewer CDD but more HDD
         rows.append({'date': date, 'cdd_min': min(dd_p25, dd_p75), 'cdd_max': max(dd_p25, dd_p75)})
 
