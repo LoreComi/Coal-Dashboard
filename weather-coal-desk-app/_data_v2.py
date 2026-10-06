@@ -15,8 +15,8 @@ import streamlit as st
 
 from _config import (
     CITY_LOCATIONS, POPULATION, REGION_MAP, CITY_TO_REGION,
-    BASE_TEMP, SEASON_START_MONTH, SEASON_START_DAY, HIST_START_YEAR, HIST_END_YEAR,
-    FIVE_YEAR_START,
+    BASE_TEMP, HIST_START_YEAR, HIST_END_YEAR,
+    FIVE_YEAR_START, region_mode, current_season_year, season_bounds,
     TABLE_HIST, TABLE_FCST, TABLE_FCST_VAREPS, TEMP_CLIM,
     CURVE_HIST, CURVE_FCST, MODEL_HIST, MODEL_FCST,
     TABLE_PRECIP_HIST, TABLE_PRECIP_FCST, PRECIP_CLIM, CURVE_PRECIP_HIST, CURVE_PRECIP_FCST,
@@ -408,8 +408,10 @@ def load_current_year_cdd_bulk(regions: tuple) -> pd.DataFrame:
     ERA5 actuals cover the whole season so far; ENS fills the 7-day gap and future dates.
     Returns DataFrame with columns: date, cdd, region.
     """
-    current_year = datetime.now().year
-    season_start = f"{current_year}-{SEASON_START_MONTH:02d}-{SEASON_START_DAY:02d}"
+    # Earliest start among the regions' current seasons (HDD and CDD seasons differ)
+    season_start = min(
+        season_bounds(r, current_season_year(r))[0] for r in regions
+    ).strftime('%Y-%m-%d')
     gap_start = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
 
     all_cities = [c for r in regions for c in REGION_MAP.get(r, [])]
@@ -474,7 +476,7 @@ def load_current_year_cdd_bulk(regions: tuple) -> pd.DataFrame:
         rd = combined[combined['region'] == r].copy()
         if rd.empty:
             continue
-        rd['cdd_city'] = (rd['temperature'] - BASE_TEMP).clip(lower=0)
+        rd['cdd_city'] = _degree_days(rd['temperature'], region_mode(r))
         pivot = rd.pivot_table(index='date', columns='city', values='cdd_city', aggfunc='mean')
         avail = [c for c in cities if c in pivot.columns]
         if not avail:
@@ -482,7 +484,9 @@ def load_current_year_cdd_bulk(regions: tuple) -> pd.DataFrame:
         w = np.array([POPULATION[c] for c in avail], dtype=float)
         w = w / w.sum()
         weighted = (pivot[avail].values * w[None, :]).sum(axis=1)
-        region_results.append(pd.DataFrame({'date': pivot.index, 'cdd': weighted, 'region': r}))
+        start = season_bounds(r, current_season_year(r))[0]
+        region_df = pd.DataFrame({'date': pivot.index, 'cdd': weighted, 'region': r})
+        region_results.append(region_df[region_df['date'] >= start])
 
     if not region_results:
         return pd.DataFrame(columns=['date', 'cdd', 'region'])
@@ -491,10 +495,11 @@ def load_current_year_cdd_bulk(regions: tuple) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def load_current_year_cdd(region: str) -> pd.DataFrame:
-    """Load current year CDD from ERA5 actuals + ECMWF-ENS forecast gap fill."""
-    current_year = datetime.now().year
-    season_start = f"{current_year}-{SEASON_START_MONTH:02d}-{SEASON_START_DAY:02d}"
+def load_current_year_cdd(region: str, mode: str | None = None) -> pd.DataFrame:
+    """Load current-season degree days (CDD or HDD per region_mode) from ERA5 actuals
+    + ECMWF-ENS forecast gap fill. Pass mode='cdd' to force CDD regardless of the season."""
+    mode = mode or region_mode(region)
+    season_start = season_bounds(region, current_season_year(region), mode)[0].strftime('%Y-%m-%d')
     cities = REGION_MAP[region]
     coord_parts = []
     for city in cities:
@@ -548,7 +553,7 @@ def load_current_year_cdd(region: str) -> pd.DataFrame:
     combined = combined.sort_values(['date', 'city']).drop_duplicates(
         subset=['date', 'city'], keep='first'
     )
-    combined['cdd_city'] = (combined['temperature'] - BASE_TEMP).clip(lower=0)
+    combined['cdd_city'] = _degree_days(combined['temperature'], mode)
     pivot = combined.pivot_table(index='date', columns='city', values='cdd_city', aggfunc='mean')
     available = [c for c in cities if c in pivot.columns]
     if not available:
@@ -558,6 +563,53 @@ def load_current_year_cdd(region: str) -> pd.DataFrame:
     weights = pops / pops.sum()
     weighted = (pivot[available].values * weights[None, :]).sum(axis=1)
     return pd.DataFrame({'date': pivot.index, 'cdd': weighted}).sort_values('date').reset_index(drop=True)
+
+
+# ─── Degree-day helpers ─────────────────────────────────────────────────────────
+# NOTE: the generic degree-day column is still called 'cdd' / 'cumulative_cdd' throughout
+# this pipeline; for regions in HDD mode it holds heating degree days.
+
+def _degree_days(temperature, mode: str):
+    """Daily degree days from mean temperature: CDD = T - base, HDD = base - T (floored at 0)."""
+    diff = (temperature - BASE_TEMP) if mode == 'cdd' else (BASE_TEMP - temperature)
+    return diff.clip(lower=0)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_historical_hdd(regions: tuple) -> pd.DataFrame:
+    """Population-weighted daily HDD per region from ERA5 city temperatures (2000 -> today).
+
+    Computed per city before weighting (as the CDD tables are) so the HDD normal is
+    consistent with the current-season HDD. Returns columns: date, region, cdd (= HDD).
+    """
+    rows = []
+    for r in regions:
+        cities = REGION_MAP.get(r, [])
+        total = sum(POPULATION[c] for c in cities)
+        for c in cities:
+            loc = CITY_LOCATIONS[c]
+            rows.append(f"({loc['latitude']}, {loc['longitude']}, '{r}', {POPULATION[c] / total})")
+    if not rows:
+        return pd.DataFrame(columns=['date', 'region', 'cdd'])
+
+    query = f"""
+    WITH w AS (
+        SELECT * FROM VALUES {", ".join(rows)} AS w(latitude, longitude, region, weight)
+    )
+    SELECT CAST(h.delivery_start AS DATE) AS date, w.region,
+           SUM(GREATEST({BASE_TEMP} - h.value, 0) * w.weight) AS cdd
+    FROM {TABLE_HIST} h
+    JOIN w ON h.latitude = w.latitude AND h.longitude = w.longitude
+    WHERE h.delivery_start >= '{HIST_START_YEAR}-01-01'
+    GROUP BY CAST(h.delivery_start AS DATE), w.region
+    ORDER BY date
+    """
+    df = run_query(query)
+    if df.empty:
+        return pd.DataFrame(columns=['date', 'region', 'cdd'])
+    df['date'] = pd.to_datetime(df['date'])
+    df['cdd'] = df['cdd'].astype(float)
+    return df
 
 
 # ─── CDD computation ────────────────────────────────────────────────────────────
@@ -618,7 +670,7 @@ def load_forecast_spread_bulk(regions: tuple) -> pd.DataFrame:
 
 
 def compute_ensemble_spread(spread_bulk_df: pd.DataFrame, region: str, cum_current: pd.DataFrame) -> pd.DataFrame:
-    """Compute cumulative CDD lower/upper bounds from ensemble 25th/75th percentile.
+    """Compute cumulative degree-day lower/upper bounds from ensemble 25th/75th percentile.
 
     Returns DataFrame with day_of_season, cumulative_lower, cumulative_upper.
     The envelope starts from the last actual (observed) cumulative value.
@@ -627,6 +679,7 @@ def compute_ensemble_spread(spread_bulk_df: pd.DataFrame, region: str, cum_curre
         return pd.DataFrame(columns=['day_of_season', 'cumulative_lower', 'cumulative_upper'])
 
     cities = REGION_MAP.get(region, [])
+    mode = region_mode(region)
     region_spread = spread_bulk_df[spread_bulk_df['region'] == region].copy()
     if region_spread.empty or not cities:
         return pd.DataFrame(columns=['day_of_season', 'cumulative_lower', 'cumulative_upper'])
@@ -639,9 +692,10 @@ def compute_ensemble_spread(spread_bulk_df: pd.DataFrame, region: str, cum_curre
             continue
         w = np.array([POPULATION[c] for c in avail], dtype=float)
         w = w / w.sum()
-        cdd_min = (np.maximum(grp.loc[avail, 'temp_p25'].values - BASE_TEMP, 0) * w).sum()
-        cdd_max = (np.maximum(grp.loc[avail, 'temp_p75'].values - BASE_TEMP, 0) * w).sum()
-        rows.append({'date': date, 'cdd_min': cdd_min, 'cdd_max': cdd_max})
+        dd_p25 = (_degree_days(grp.loc[avail, 'temp_p25'], mode).values * w).sum()
+        dd_p75 = (_degree_days(grp.loc[avail, 'temp_p75'], mode).values * w).sum()
+        # Cold ensemble members give fewer CDD but more HDD
+        rows.append({'date': date, 'cdd_min': min(dd_p25, dd_p75), 'cdd_max': max(dd_p25, dd_p75)})
 
     if not rows:
         return pd.DataFrame(columns=['day_of_season', 'cumulative_lower', 'cumulative_upper'])
@@ -668,9 +722,9 @@ def compute_ensemble_spread(spread_bulk_df: pd.DataFrame, region: str, cum_curre
     return spread_future[['day_of_season', 'cumulative_lower', 'cumulative_upper']]
 
 
-def compute_cumulative(cdd_df: pd.DataFrame, year: int) -> pd.DataFrame:
-    start = pd.Timestamp(year=year, month=SEASON_START_MONTH, day=SEASON_START_DAY)
-    end = pd.Timestamp(year=year + 1, month=SEASON_START_MONTH, day=SEASON_START_DAY - 1)
+def compute_cumulative(cdd_df: pd.DataFrame, year: int, region: str) -> pd.DataFrame:
+    """Cumulative degree days over the region's season that starts in `year`."""
+    start, end = season_bounds(region, year)
     mask = (cdd_df['date'] >= start) & (cdd_df['date'] <= end)
     s = cdd_df[mask].copy().sort_values('date')
     if s.empty:
@@ -680,7 +734,7 @@ def compute_cumulative(cdd_df: pd.DataFrame, year: int) -> pd.DataFrame:
     return s[['date', 'day_of_season', 'cumulative_cdd']]
 
 
-def compute_normal(cdd_df: pd.DataFrame,
+def compute_normal(cdd_df: pd.DataFrame, region: str,
                    start_year: int = HIST_START_YEAR,
                    end_year: int = HIST_END_YEAR) -> pd.DataFrame:
     """Cumulative-CDD climatology (mean ± 1σ per day-of-season) over [start_year, end_year].
@@ -690,7 +744,7 @@ def compute_normal(cdd_df: pd.DataFrame,
     """
     curves = []
     for yr in range(start_year, end_year + 1):
-        c = compute_cumulative(cdd_df, yr)
+        c = compute_cumulative(cdd_df, yr, region)
         if not c.empty:
             c['year'] = yr
             curves.append(c[['day_of_season', 'cumulative_cdd', 'year']])
@@ -704,16 +758,16 @@ def compute_normal(cdd_df: pd.DataFrame,
     return stats
 
 
-def compute_five_year_avg(cdd_df: pd.DataFrame) -> pd.DataFrame:
+def compute_five_year_avg(cdd_df: pd.DataFrame, region: str) -> pd.DataFrame:
     """Trailing 5-year cumulative-CDD average per day-of-season (FIVE_YEAR_START–HIST_END_YEAR)."""
-    return compute_normal(cdd_df, start_year=FIVE_YEAR_START, end_year=HIST_END_YEAR)
+    return compute_normal(cdd_df, region, start_year=FIVE_YEAR_START, end_year=HIST_END_YEAR)
 
 
-def load_all_historical_cumulative(historical_cdd: pd.DataFrame) -> dict:
+def load_all_historical_cumulative(historical_cdd: pd.DataFrame, region: str) -> dict:
     """Pre-compute cumulative CDD DataFrames for every historical year (2000–2024)."""
     result = {}
     for year in range(HIST_START_YEAR, HIST_END_YEAR + 1):
-        cum = compute_cumulative(historical_cdd, year)
+        cum = compute_cumulative(historical_cdd, year, region)
         if not cum.empty:
             result[year] = cum
     return result
@@ -758,7 +812,8 @@ def compute_temperature_climatology_simple(hist_df: pd.DataFrame) -> pd.DataFram
     return stats
 
 
-def compute_similar_years(historical_cdd: pd.DataFrame, current_cum: pd.DataFrame, n_similar: int = 5) -> list:
+def compute_similar_years(historical_cdd: pd.DataFrame, current_cum: pd.DataFrame,
+                          region: str, n_similar: int = 5) -> list:
     """Return the n historical years whose CDD trajectory best matches the current year's.
 
     Similarity = weighted blend of RMSE (70%) and rate-of-change RMSE (30%) over
@@ -776,7 +831,7 @@ def compute_similar_years(historical_cdd: pd.DataFrame, current_cum: pd.DataFram
     for year in range(HIST_START_YEAR, HIST_END_YEAR + 1):
         if year == curr_y:
             continue
-        hist_cum = compute_cumulative(historical_cdd, year)
+        hist_cum = compute_cumulative(historical_cdd, year, region)
         if hist_cum.empty or len(hist_cum) < n_days:
             continue
         hist_vals = hist_cum['cumulative_cdd'].iloc[:n_days].values

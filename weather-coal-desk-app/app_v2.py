@@ -18,11 +18,12 @@ from _config import (
     BASE_TEMP, DEFAULT_REGIONS,
 )
 from _config import TABLE_FCST, TABLE_FCST_VAREPS
+from _config import region_mode, current_season_year
 from _data_v2 import (
     load_historical, load_forecast, load_city_timeseries, load_anomalies,
     compute_region_cdd, compute_cumulative, compute_normal, compute_five_year_avg,
     load_precomputed_cdd, load_precomputed_historical, load_precomputed_forecasts,
-    load_current_year_cdd, load_gridded_anomalies, load_gridded_anomalies_multiday,
+    load_current_year_cdd, load_historical_hdd, load_gridded_anomalies, load_gridded_anomalies_multiday,
     load_gridded_precip_deviation, MAP_REGIONS,
     load_all_historical_cumulative, compute_similar_years,
     load_watershed_precip, load_gatun_lake_levels, load_hurricane_data,
@@ -60,22 +61,31 @@ def kpi_card(label, value, unit, delta=None, card_class=""):
 
 # ─── Tab 1: CDD Dashboard ────────────────────────────────────────────────────────
 def render_cdd_dashboard():
-    st.markdown("#### COOLING DEGREE DAYS")
-    st.caption("Population-weighted CDD. Includes ecmwf-ens (14d) + ecmwf-vareps (44d extended).")
+    st.markdown("#### COOLING / HEATING DEGREE DAYS")
+    st.caption(
+        "Population-weighted degree days. Regions with a clear seasonality show **HDD from 1 Oct** "
+        "and **CDD from 1 May**; other regions stay on CDD. Includes ecmwf-ens (14d) forecast."
+    )
 
     selected = st.multiselect("Regions", list(REGION_MAP.keys()), DEFAULT_REGIONS, label_visibility="collapsed")
     if not selected:
         st.info("Select at least one region.")
         return
 
-    current_year = datetime.now().year
     summary_rows = []
+    hdd_regions = tuple(sorted(r for r in selected if region_mode(r) == 'hdd'))
 
     # ── Historical CDD (2000-2024): one query for all regions ─────────────────
     try:
         precomp_hist = load_precomputed_historical()
     except Exception:
         precomp_hist = pd.DataFrame()
+
+    # ── HDD-mode regions: historical HDD built per city (not in the precomputed table) ─
+    try:
+        hist_hdd = load_historical_hdd(hdd_regions) if hdd_regions else pd.DataFrame()
+    except Exception:
+        hist_hdd = pd.DataFrame()
 
     # ── Current year: ERA5 actuals + ENS forecast, all regions in two queries ─
     try:
@@ -93,8 +103,14 @@ def render_cdd_dashboard():
     figs = []  # (region, fig) on success, (region, error_str) on failure
     for region in selected:
         try:
-            # Historical CDD (2000-2024) for normal / prev year / similar years
-            if not precomp_hist.empty and region in precomp_hist['region'].values:
+            mode = region_mode(region).upper()
+            season_year = current_season_year(region)
+            # Historical degree days (2000-2024) for normal / prev season / similar years
+            if mode == 'HDD':
+                if hist_hdd.empty or region not in hist_hdd['region'].values:
+                    raise RuntimeError("Historical HDD unavailable")
+                region_cdd = hist_hdd[hist_hdd['region'] == region][['date', 'cdd']].sort_values('date').reset_index(drop=True)
+            elif not precomp_hist.empty and region in precomp_hist['region'].values:
                 region_cdd = precomp_hist[precomp_hist['region'] == region][['date', 'cdd']].sort_values('date').reset_index(drop=True)
             else:
                 hist_df = load_historical(region)
@@ -106,19 +122,19 @@ def render_cdd_dashboard():
             else:
                 combined = load_current_year_cdd(region)
 
-            cum_current = compute_cumulative(combined, current_year)
-            cum_prev = compute_cumulative(region_cdd, current_year - 1)
-            normal = compute_normal(region_cdd)
-            five_yr = compute_five_year_avg(region_cdd)
+            cum_current = compute_cumulative(combined, season_year, region)
+            cum_prev = compute_cumulative(region_cdd, season_year - 1, region)
+            normal = compute_normal(region_cdd, region)
+            five_yr = compute_five_year_avg(region_cdd, region)
 
-            all_hist_cum = load_all_historical_cumulative(region_cdd)
-            sim_years = compute_similar_years(region_cdd, cum_current)
+            all_hist_cum = load_all_historical_cumulative(region_cdd, region)
+            sim_years = compute_similar_years(region_cdd, cum_current, region)
 
             # Ensemble uncertainty band on the forecast portion
             ensemble_spread = compute_ensemble_spread(spread_bulk, region, cum_current)
 
             fig = make_cumulative_cdd_chart(
-                region, cum_current, cum_prev, normal, current_year,
+                region, cum_current, cum_prev, normal, season_year,
                 all_historical_cumulative=all_hist_cum,
                 similar_years=sim_years,
                 ensemble_spread=ensemble_spread,
@@ -138,7 +154,7 @@ def render_cdd_dashboard():
             normal_val = _at_day(normal)
             five_val = _at_day(five_yr)
             summary_rows.append({
-                'Region': region, 'CDD': total, 'Normal': normal_val,
+                'Region': region, 'Type': mode, 'Degree days': total, 'Normal': normal_val,
                 'Anomaly': total - normal_val, '5yr Avg': five_val,
                 'vs 5yr': total - five_val,
             })
@@ -152,16 +168,18 @@ def render_cdd_dashboard():
         for i, row in enumerate(summary_rows[:6]):
             a = row['Anomaly']
             with kpi_cols[i]:
-                st.markdown(kpi_card(row['Region'], a, "°C·d", card_class="kpi-card-warm" if a > 0 else "kpi-card-cool"), unsafe_allow_html=True)
+                # More CDD = warmer, more HDD = colder
+                warm = (a > 0) == (row['Type'] == 'CDD')
+                st.markdown(kpi_card(f"{row['Region']} ({row['Type']})", a, "°C·d", card_class="kpi-card-warm" if warm else "kpi-card-cool"), unsafe_allow_html=True)
 
         disp = pd.DataFrame(summary_rows)
         disp = disp.assign(
-            CDD=disp['CDD'].map(lambda v: f"{v:.0f}"),
+            **{'Degree days': disp['Degree days'].map(lambda v: f"{v:.0f}")},
             Normal=disp['Normal'].map(lambda v: f"{v:.0f}"),
             Anomaly=disp['Anomaly'].map(lambda v: f"{v:+.0f}"),
             **{'5yr Avg': disp['5yr Avg'].map(lambda v: f"{v:.0f}"),
                'vs 5yr': disp['vs 5yr'].map(lambda v: f"{v:+.0f}")},
-        )[['Region', 'CDD', 'Normal', 'Anomaly', '5yr Avg', 'vs 5yr']]
+        )[['Region', 'Type', 'Degree days', 'Normal', 'Anomaly', '5yr Avg', 'vs 5yr']]
         st.dataframe(disp, use_container_width=True, hide_index=True)
         st.markdown("---")
 
@@ -1043,7 +1061,7 @@ def _compute_cdd_summary(regions: list) -> dict:
     for region in regions:
         try:
             # ── Current-year CDD: ERA5 actuals + ECMWF-ENS forecast gap-fill ─────
-            current_df = load_current_year_cdd(region)
+            current_df = load_current_year_cdd(region, mode='cdd')
             if current_df.empty:
                 continue
             current_df = current_df.copy()

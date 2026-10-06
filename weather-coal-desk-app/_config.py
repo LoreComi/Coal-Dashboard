@@ -4,10 +4,19 @@ Cities, regions, populations, constants.
 """
 from __future__ import annotations
 
-# CDD parameters
-BASE_TEMP = 18.0  # Celsius
+from datetime import date
+
+import pandas as pd
+
+# Degree-day parameters
+BASE_TEMP = 18.0  # Celsius — base for both CDD and HDD
+# Legacy fixed season start, still used by the older app.py / _data.py
 SEASON_START_MONTH = 4
 SEASON_START_DAY = 15
+# Seasonal switch (app_v2): regions with a clear seasonality show cumulative CDD from
+# 1 May and cumulative HDD from 1 Oct. Other regions stay on CDD (12 months from 1 May).
+CDD_SEASON_START = (5, 1)    # (month, day)
+HDD_SEASON_START = (10, 1)
 HIST_START_YEAR = 2000
 HIST_END_YEAR = 2024
 # Trailing window for the "past 5-year average" comparison (most recent 5 hist years)
@@ -154,3 +163,50 @@ CITY_TO_REGION: dict[str, str] = {
 # Default regions to show
 DEFAULT_REGIONS = ['China North', 'China South', 'China Central', 'Japan',
                    'South Korea', 'India']
+
+# Regions with a clear heating/cooling seasonality (the rest are tropical/sub-tropical
+# and stay on CDD all year)
+SEASONAL_REGIONS = {
+    'Germany', 'France', 'Japan', 'South Korea',
+    'China North', 'China Central', 'China South',
+    'USA (Kansas & Oklahoma)', 'USA (Columbia)', 'USA (Tallahassee)', 'USA (Raleigh)',
+}
+
+
+def region_mode(region: str, today=None) -> str:
+    """'cdd' or 'hdd' for the region on `today`: HDD from 1 Oct to 30 Apr, CDD from 1 May."""
+    if region not in SEASONAL_REGIONS:
+        return 'cdd'
+    today = today or date.today()
+    return 'hdd' if (today.month, today.day) >= HDD_SEASON_START or \
+        (today.month, today.day) < CDD_SEASON_START else 'cdd'
+
+
+def current_season_year(region: str, today=None) -> int:
+    """Calendar year in which the region's current season started."""
+    today = today or date.today()
+    start = HDD_SEASON_START if region_mode(region, today) == 'hdd' else CDD_SEASON_START
+    return today.year if (today.month, today.day) >= start else today.year - 1
+
+
+def season_bounds(region: str, year: int, mode: str | None = None) -> tuple:
+    """(start, end) Timestamps of the season that starts in `year` for the region."""
+    mode = mode or region_mode(region)
+    if mode == 'hdd':
+        start = pd.Timestamp(year=year, month=HDD_SEASON_START[0], day=HDD_SEASON_START[1])
+        end = pd.Timestamp(year=year + 1, month=CDD_SEASON_START[0], day=CDD_SEASON_START[1]) \
+            - pd.Timedelta(days=1)
+    else:
+        start = pd.Timestamp(year=year, month=CDD_SEASON_START[0], day=CDD_SEASON_START[1])
+        if region in SEASONAL_REGIONS:
+            end = pd.Timestamp(year=year, month=HDD_SEASON_START[0], day=HDD_SEASON_START[1]) \
+                - pd.Timedelta(days=1)
+        else:
+            end = pd.Timestamp(year=year + 1, month=CDD_SEASON_START[0], day=CDD_SEASON_START[1]) \
+                - pd.Timedelta(days=1)
+    return start, end
+
+
+def season_label(region: str, year: int) -> str:
+    """'2026' for a CDD season, '2026/27' for an HDD (winter) season."""
+    return f"{year}/{str(year + 1)[-2:]}" if region_mode(region) == 'hdd' else str(year)

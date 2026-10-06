@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 from _style import PLOTLY_LAYOUT
-from _config import BASE_TEMP
+from _config import BASE_TEMP, region_mode, season_bounds, season_label
 
 # Colors for the 5 most-similar historical years — saturated for white background
 _SIMILAR_COLORS = ['#1d4ed8', '#7c3aed', '#ea580c', '#0369a1', '#16a34a']
@@ -37,12 +37,13 @@ def make_cumulative_cdd_chart(
     ensemble_spread: pd.DataFrame = None,
     five_year_avg: pd.DataFrame = None,
 ) -> go.Figure:
-    """Build the cumulative CDD chart for one region.
+    """Build the cumulative degree-day chart (CDD or HDD, per region_mode) for one region.
 
     Mirrors the notebook style: faint grey background for all historical years,
     5 most-similar years highlighted in color, current year in bold red.
 
     Args:
+        current_year: calendar year in which the current season started.
         all_historical_cumulative: dict {year: cum_df} pre-computed for 2000-2024.
         similar_years: list of (year, score) tuples from compute_similar_years(),
                        sorted best-first.
@@ -51,6 +52,9 @@ def make_cumulative_cdd_chart(
     """
     fig = go.Figure()
     prev_year = current_year - 1
+    mode = region_mode(region).upper()
+    start, end = season_bounds(region, current_year)
+    cur_label = season_label(region, current_year)
     similar_year_set = {y for y, _ in (similar_years or [])}
 
     # ── All historical years as faint grey background lines ──────────────────
@@ -76,7 +80,7 @@ def make_cumulative_cdd_chart(
                 x=cum_df['day_of_season'], y=cum_df['cumulative_cdd'],
                 mode='lines',
                 line=dict(color=color, width=1.8, dash='dot'),
-                name=f'{year}  (#{rank + 1} similar)',
+                name=f'{season_label(region, year)}  (#{rank + 1} similar)',
                 opacity=0.85,
             ))
 
@@ -111,7 +115,7 @@ def make_cumulative_cdd_chart(
         fig.add_trace(go.Scatter(
             x=cum_prev['day_of_season'], y=cum_prev['cumulative_cdd'],
             mode='lines', line=dict(color='#6b7280', width=1.5, dash='dash'),
-            name=str(prev_year),
+            name=season_label(region, prev_year),
         ))
 
     # ── Current year  (actual solid + forecast dashed) ───────────────────────
@@ -124,7 +128,7 @@ def make_cumulative_cdd_chart(
             fig.add_trace(go.Scatter(
                 x=actual['day_of_season'], y=actual['cumulative_cdd'],
                 mode='lines', line=dict(color='#dc2626', width=3),
-                name=f'{current_year} (Actual)',
+                name=f'{cur_label} (Actual)',
             ))
 
         if not forecast.empty:
@@ -132,7 +136,7 @@ def make_cumulative_cdd_chart(
             fig.add_trace(go.Scatter(
                 x=connect['day_of_season'], y=connect['cumulative_cdd'],
                 mode='lines', line=dict(color='#dc2626', width=2, dash='dash'),
-                name=f'{current_year} (Forecast)',
+                name=f'{cur_label} (Forecast)',
             ))
 
     # ── Ensemble spread band (shaded uncertainty around forecast) ─────────────
@@ -149,9 +153,9 @@ def make_cumulative_cdd_chart(
         ))
 
     fig.update_layout(
-        title=dict(text=f"Cumulative CDD — {region}", font=dict(size=14, color='#0f172a')),
-        xaxis=dict(title="Days since April 15", range=[0, 150]),
-        yaxis_title="Cumulative CDD (°C·d)",
+        title=dict(text=f"Cumulative {mode} — {region}", font=dict(size=14, color='#0f172a')),
+        xaxis=dict(title=f"Days since {start.day} {start:%B}", range=[0, (end - start).days + 1]),
+        yaxis_title=f"Cumulative {mode} (°C·d)",
         height=400,
         legend=dict(
             x=1.01, y=1, xanchor='left',
